@@ -1,26 +1,111 @@
 @import "tailwindcss";
 
+/* Design tokens: mdfiles/designs.md section 2. */
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  color-scheme: dark;
+
+  --gp-bg: #09090f;
+  --gp-surface: #11111b;
+  --gp-surface-raised: #191927;
+  --gp-surface-muted: #202033;
+  --gp-border: #2b2b40;
+  --gp-text: #f5f3ff;
+  --gp-text-muted: #a7a5bb;
+  /* Raised from the suggested #77758D, which fails AA on every surface. */
+  --gp-text-subtle: #9391ab;
+  --gp-primary: #8b5cf6;
+  --gp-primary-hover: #a78bfa;
+  --gp-primary-soft: #2a2044;
+  /* Filled-button fills: white on --gp-primary is only 4.23:1. */
+  --gp-primary-solid: #7445ea;
+  --gp-primary-solid-hover: #7c4df0;
+  /* Lavender from the Stitch screens: accent text and onboarding actions. */
+  --gp-lavender: #d0bcff;
+  --gp-lavender-hover: #dfd2ff;
+  --gp-on-lavender: #240a5e;
+  --gp-info: #60a5fa;
+  --gp-success: #34d399;
+  --gp-warning: #fbbf24;
+  --gp-danger: #fb7185;
+
+  --gp-safe-bottom: env(safe-area-inset-bottom, 0px);
 }
 
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --color-canvas: var(--gp-bg);
+  --color-surface: var(--gp-surface);
+  --color-surface-raised: var(--gp-surface-raised);
+  --color-surface-muted: var(--gp-surface-muted);
+  --color-line: var(--gp-border);
+  --color-ink: var(--gp-text);
+  --color-ink-muted: var(--gp-text-muted);
+  --color-ink-subtle: var(--gp-text-subtle);
+  --color-primary: var(--gp-primary);
+  --color-primary-hover: var(--gp-primary-hover);
+  --color-primary-soft: var(--gp-primary-soft);
+  --color-primary-solid: var(--gp-primary-solid);
+  --color-primary-solid-hover: var(--gp-primary-solid-hover);
+  --color-lavender: var(--gp-lavender);
+  --color-lavender-hover: var(--gp-lavender-hover);
+  --color-on-lavender: var(--gp-on-lavender);
+  --color-info: var(--gp-info);
+  --color-success: var(--gp-success);
+  --color-warning: var(--gp-warning);
+  --color-danger: var(--gp-danger);
+
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-jetbrains-mono), ui-monospace, monospace;
+
+  --radius-card: 20px;
+  --radius-control: 12px;
+
+  --shadow-card: 0 1px 0 0 rgb(255 255 255 / 0.03) inset, 0 12px 32px -20px rgb(0 0 0 / 0.8);
+  --shadow-button: 0 1px 0 0 rgb(255 255 255 / 0.16) inset, 0 8px 20px -12px rgb(139 92 246 / 0.8);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+@layer base {
+  html {
+    background: var(--gp-bg);
+    -webkit-text-size-adjust: 100%;
+    /* Keeps focused controls clear of the sticky top bar and bottom action bars. */
+    scroll-padding-block: 5rem 10rem;
+  }
+
+  body {
+    background: var(--gp-bg);
+    color: var(--gp-text);
+    font-family: var(--font-sans);
+    font-size: 15px;
+    line-height: 1.55;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--gp-primary-hover);
+    outline-offset: 2px;
   }
 }
 
-body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+@utility tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Monospaced metadata label used across the Stitch screens. */
+@utility label-mono {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0.12em;
+  line-height: 1.4;
+  text-transform: uppercase;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
 }
