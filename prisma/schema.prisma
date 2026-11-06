@@ -1,0 +1,369 @@
+// =============================================================================
+// GlobalPay — Prisma Schema
+// =============================================================================
+// Database: MySQL (InnoDB) — fixed decision per PRD §7.1
+// ORM: Prisma
+//
+// Design decisions resolved here:
+//   - Identity:        Anonymous server-issued DemoSession (Option B from database-schema.md §2)
+//   - Status enum:     TransactionStatus uses AWAITING_APPROVAL (matches api-contract.md)
+//   - Money:           Decimal(20,8) for amounts; Decimal(24,12) for rates
+//   - Idempotency:     Scoped to (demoSessionId, operationType, keyHash) — never raw key
+//   - Sensitive data:  No tokens, secrets, or credentials stored in any model
+//   - Bank linking:    BankConnection stores only mandate ID ref and masked account info
+//   - Preferences:     TravellerPreference persisted per session
+//   - providerOrderId / providerCaptureId: nullable unique handled via MySQL nullable index
+//
+// Run: npx prisma validate && npx prisma generate
+// Migrate: npx prisma migrate dev --name init   (dev only — review SQL before applying)
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider          = "mysql"
+  url               = env("DATABASE_URL")
+  shadowDatabaseUrl = env("SHADOW_DATABASE_URL")
+}
+
+// =============================================================================
+// Enums
+// =============================================================================
+
+/// User-facing transaction status. Matches api-contract.md §5 and payment-flow.md §17.2.
+enum TransactionStatus {
+  CREATED
+  AWAITING_APPROVAL
+  CAPTURE_PENDING
+  COMPLETED
+  CANCELLED
+  FAILED
+  STATUS_UNKNOWN
+}
+
+/// PaymentAttempt-level status (more granular than Transaction status).
+enum PaymentAttemptStatus {
+  CREATED
+  AWAITING_APPROVAL
+  APPROVED
+  CAPTURE_PENDING
+  COMPLETED
+  DENIED
+  CANCELLED
+  FAILED
+  STATUS_UNKNOWN
+}
+
+/// Supported payment providers. Currently PayPal only.
+enum PaymentProvider {
+  PAYPAL
+}
+
+/// Payment environment. SANDBOX for hackathon MVP.
+enum PaymentEnvironment {
+  SANDBOX
+}
+
+/// Idempotency operation types for payment mutations.
+enum IdempotencyOperationType {
+  PAYPAL_CREATE
+  PAYPAL_CAPTURE
+}
+
+/// Idempotency operation outcome.
+enum IdempotencyStatus {
+  IN_PROGRESS
+  SUCCEEDED
+  FAILED
+  UNKNOWN
+}
+
+/// Bank-linking status values aligned with frontend BankLinkingStatus.
+enum BankConnectionStatus {
+  NOT_LINKED
+  LINKING_IN_PROGRESS
+  LINKED
+  LINKING_FAILED
+  CONNECTION_EXPIRED
+  RECONNECTION_REQUIRED
+}
+
+// =============================================================================
+// Models
+// =============================================================================
+
+/// Server-issued anonymous demo session. The session token is NEVER stored here —
+/// only its SHA-256 hash. Delivered to the client as a Secure HttpOnly SameSite=Strict cookie.
+model DemoSession {
+  id         String   @id @default(cuid()) @db.VarChar(30)
+  /// SHA-256 hex hash of the session token. Never log or return this value.
+  tokenHash  String   @unique @db.VarChar(128)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  lastSeenAt DateTime?
+
+  // Relations
+  preference  TravellerPreference?
+  bankConn    BankConnection?
+  transactions Transaction[]
+  operations  IdempotencyOperation[]
+
+  @@index([expiresAt])
+  @@map("demo_sessions")
+}
+
+/// Persisted traveller preferences for a session. Replaces in-memory TravellerPreferencesProvider state.
+model TravellerPreference {
+  id              String      @id @default(cuid()) @db.VarChar(30)
+  sessionId       String      @unique @db.VarChar(30)
+  /// ISO 3166-1 alpha-2 home country code.
+  homeCountry     String      @db.Char(2)
+  /// ISO 4217 display currency code.
+  displayCurrency String      @db.Char(3)
+  /// JSON array of ISO 3166-1 alpha-2 destination country codes.
+  destinations    Json
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+
+  session         DemoSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId])
+  @@map("traveller_preferences")
+}
+
+/// Bank-linking status for a session. No tokens or credentials are stored here.
+/// providerMandateId holds only an opaque external reference — never an access token.
+model BankConnection {
+  id                  String              @id @default(cuid()) @db.VarChar(30)
+  sessionId           String              @unique @db.VarChar(30)
+  status              BankConnectionStatus @default(NOT_LINKED)
+  /// Opaque provider mandate reference — NOT an access token. Nullable.
+  providerMandateId   String?             @db.VarChar(255)
+  /// Display name of the institution, e.g. "Chase". Never a full account number.
+  institutionName     String?             @db.VarChar(255)
+  /// Last 4 digits or masked token only. e.g. "••••1234". Never a full account number.
+  maskedAccountNumber String?             @db.VarChar(50)
+  accountType         String?             @db.VarChar(50)
+  /// True when this record was created via the demo mock flow, not a real provider.
+  isSimulated         Boolean             @default(true)
+  authorizedAt        DateTime?
+  expiresAt           DateTime?
+  createdAt           DateTime            @default(now())
+  updatedAt           DateTime            @updatedAt
+
+  session             DemoSession         @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId])
+  @@index([status])
+  @@map("bank_connections")
+}
+
+/// Catalogue of demo merchants. Seeded via prisma/seed.ts. Never contains real merchant data.
+model Merchant {
+  id               String        @id @default(cuid()) @db.VarChar(30)
+  name             String        @db.VarChar(120)
+  /// Stable slug for seeded demo merchants. Used for QR lookup.
+  slug             String?       @unique @db.VarChar(140)
+  category         String        @db.VarChar(40)
+  description      String?       @db.VarChar(500)
+  /// ISO 3166-1 alpha-2.
+  countryCode      String?       @db.Char(2)
+  /// ISO 4217 merchant's display/billing currency.
+  displayCurrency  String        @db.Char(3)
+  /// JSON array of supported payment method identifiers. Validated in application code.
+  supportedMethods Json
+  /// Unique identifier used to match a demo QR code to this merchant.
+  demoQrIdentifier String?       @unique @db.VarChar(100)
+  isDemo           Boolean       @default(true)
+  isActive         Boolean       @default(true)
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+
+  transactions     Transaction[]
+
+  @@index([isActive, category])
+  @@index([countryCode, isActive])
+  @@map("merchants")
+}
+
+/// Indicative rate observation or provider quote. Immutable once created.
+/// Create a new record when rates update; never overwrite historical data.
+model CurrencyQuote {
+  id              String        @id @default(cuid()) @db.VarChar(30)
+  baseAmount      Decimal       @db.Decimal(20, 8)
+  baseCurrency    String        @db.Char(3)
+  convertedAmount Decimal       @db.Decimal(20, 8)
+  quoteCurrency   String        @db.Char(3)
+  /// High-precision rate. Decimal(24,12) supports most FX precision requirements.
+  rate            Decimal       @db.Decimal(24, 12)
+  /// Provider/source identifier. Never describe a static value as "live".
+  source          String        @db.VarChar(100)
+  /// Timestamp associated with the rate data from the provider.
+  asOf            DateTime
+  createdAt       DateTime      @default(now())
+  expiresAt       DateTime?
+  /// Always true for GlobalPay MVP; we show indicative estimates only.
+  isIndicative    Boolean       @default(true)
+
+  transactions    Transaction[]
+
+  @@index([baseCurrency, quoteCurrency, asOf])
+  @@index([expiresAt])
+  @@map("currency_quotes")
+}
+
+/// Application-level transaction record. The user-facing record of a payment intent.
+/// Status is set only by trusted server-side service code, never by client input.
+model Transaction {
+  id              String            @id @default(cuid()) @db.VarChar(30)
+  demoSessionId   String            @db.VarChar(30)
+  merchantId      String            @db.VarChar(30)
+  currencyQuoteId String?           @db.VarChar(30)
+
+  /// Requested transaction amount in merchant currency. DECIMAL — not floating point.
+  amount          Decimal           @db.Decimal(20, 8)
+  /// Merchant/transaction currency (ISO 4217).
+  currency        String            @db.Char(3)
+
+  // FX snapshot fields — captured at transaction creation time (PRD §8, audit GAP-DB-03)
+  /// User's home currency at time of transaction creation (ISO 4217).
+  homeCurrency        String?       @db.Char(3)
+  /// Indicative exchange rate snapshot at transaction creation.
+  indicativeRate      Decimal?      @db.Decimal(24, 12)
+  /// Estimated home-currency amount at time of creation (informational only).
+  estimatedHomeAmount Decimal?      @db.Decimal(20, 8)
+  /// Structured fee breakdown as JSON. e.g. { "fxFee": "0.00", "source": "demo" }
+  feeBreakdown        Json?
+
+  status          TransactionStatus @default(CREATED)
+  /// Immutable JSON snapshot of the quote used for display (rate, source, timestamp, baseCurrency).
+  quoteSnapshot   Json?
+
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+  /// Set only after verified PayPal capture — never from client input.
+  completedAt     DateTime?
+  cancelledAt     DateTime?
+  /// Safe internal classification — never raw provider error text.
+  failureCode     String?           @db.VarChar(80)
+
+  demoSession     DemoSession       @relation(fields: [demoSessionId], references: [id], onDelete: Restrict)
+  merchant        Merchant          @relation(fields: [merchantId], references: [id], onDelete: Restrict)
+  currencyQuote   CurrencyQuote?    @relation(fields: [currencyQuoteId], references: [id], onDelete: SetNull)
+  paymentAttempts PaymentAttempt[]
+  events          TransactionEvent[]
+  operations      IdempotencyOperation[]
+
+  @@index([demoSessionId, createdAt])
+  @@index([status, updatedAt])
+  @@index([merchantId, createdAt])
+  @@map("transactions")
+}
+
+/// A specific PayPal Sandbox order/capture attempt. Separated from Transaction so
+/// retries are tracked without corrupting the user-facing transaction record.
+model PaymentAttempt {
+  id                     String               @id @default(cuid()) @db.VarChar(30)
+  transactionId          String               @db.VarChar(30)
+  provider               PaymentProvider      @default(PAYPAL)
+  environment            PaymentEnvironment   @default(SANDBOX)
+  status                 PaymentAttemptStatus @default(CREATED)
+
+  /// Provider order reference. Unique per (provider, environment) when present.
+  providerOrderId        String?              @db.VarChar(120)
+  /// Provider capture reference. Unique per (provider, environment) when present.
+  providerCaptureId      String?              @db.VarChar(120)
+
+  /// Expected amount sent to the provider. Must match the transaction amount.
+  amount                 Decimal              @db.Decimal(20, 8)
+  currency               String               @db.Char(3)
+
+  createdAt              DateTime             @default(now())
+  updatedAt              DateTime             @updatedAt
+  approvedAt             DateTime?
+  captureRequestedAt     DateTime?
+  /// Set only after verified successful capture — never from a timeout or guess.
+  capturedAt             DateTime?
+  lastCheckedAt          DateTime?
+  failureCode            String?              @db.VarChar(80)
+  /// Normalized provider status string — not treated as trusted until validated.
+  providerStatus         String?              @db.VarChar(80)
+  reconciliationNeeded   Boolean              @default(false)
+  reconciliationAttempts Int                  @default(0)
+
+  transaction            Transaction          @relation(fields: [transactionId], references: [id], onDelete: Restrict)
+  events                 TransactionEvent[]
+  operations             IdempotencyOperation[]
+
+  // Unique constraints for provider identifiers prevent duplicate capture associations.
+  // MySQL treats NULL as distinct for unique indexes — multiple NULL rows are allowed,
+  // which is the desired behavior here (no order/capture yet assigned).
+  @@unique([provider, environment, providerOrderId])
+  @@unique([provider, environment, providerCaptureId])
+  @@index([transactionId, createdAt])
+  @@index([reconciliationNeeded, updatedAt])
+  @@map("payment_attempts")
+}
+
+/// Idempotency guard for PAYPAL_CREATE and PAYPAL_CAPTURE operations.
+/// Key is NEVER stored raw — only as a hash scoped to (session, operationType).
+model IdempotencyOperation {
+  id                 String                   @id @default(cuid()) @db.VarChar(30)
+  demoSessionId      String                   @db.VarChar(30)
+  transactionId      String                   @db.VarChar(30)
+  paymentAttemptId   String?                  @db.VarChar(30)
+  operationType      IdempotencyOperationType
+  /// SHA-256 of (sessionId + operationType + rawKey). Never store raw key.
+  keyHash            String                   @db.VarChar(128)
+  /// SHA-256 of normalized, validated request body (excluding secrets).
+  requestFingerprint String                   @db.VarChar(128)
+  status             IdempotencyStatus        @default(IN_PROGRESS)
+  httpStatus         Int?
+  /// Minimal non-secret result for safe replay. No checkout URLs, no provider payloads.
+  safeResult         Json?
+  createdAt          DateTime                 @default(now())
+  updatedAt          DateTime                 @updatedAt
+  expiresAt          DateTime?
+
+  demoSession        DemoSession              @relation(fields: [demoSessionId], references: [id], onDelete: Restrict)
+  transaction        Transaction              @relation(fields: [transactionId], references: [id], onDelete: Restrict)
+  paymentAttempt     PaymentAttempt?          @relation(fields: [paymentAttemptId], references: [id], onDelete: SetNull)
+
+  /// Composite unique: same session + operation type + key hash must map to exactly one operation.
+  @@unique([demoSessionId, operationType, keyHash])
+  @@index([transactionId, operationType, createdAt])
+  @@index([status, updatedAt])
+  @@map("idempotency_operations")
+}
+
+/// Minimal append-only audit trail of meaningful state transitions.
+/// Never contains secrets, tokens, card data, raw provider payloads, or full prompts.
+model TransactionEvent {
+  id               String          @id @default(cuid()) @db.VarChar(30)
+  transactionId    String          @db.VarChar(30)
+  paymentAttemptId String?         @db.VarChar(30)
+  /// Controlled string from an application enum. e.g. TRANSACTION_CREATED, CAPTURE_VERIFIED.
+  eventType        String          @db.VarChar(80)
+  fromStatus       String?         @db.VarChar(40)
+  toStatus         String?         @db.VarChar(40)
+  /// Source of the event. e.g. API, PAYPAL_VERIFICATION, RECONCILIATION.
+  source           String          @db.VarChar(40)
+  /// X-Request-ID for log correlation.
+  requestId        String?         @db.VarChar(100)
+  /// Small allowlisted JSON object. No secrets, PII, or raw provider data.
+  metadata         Json?
+  createdAt        DateTime        @default(now())
+
+  transaction      Transaction     @relation(fields: [transactionId], references: [id], onDelete: Restrict)
+  paymentAttempt   PaymentAttempt? @relation(fields: [paymentAttemptId], references: [id], onDelete: SetNull)
+
+  @@index([transactionId, createdAt])
+  @@index([paymentAttemptId, createdAt])
+  @@index([eventType, createdAt])
+  @@map("transaction_events")
+}
+
