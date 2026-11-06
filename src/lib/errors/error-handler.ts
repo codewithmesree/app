@@ -7,7 +7,7 @@
 
 import { NextResponse } from "next/server";
 import { ZodError } from "zod";
-import { ApiError, ValidationErrorDetail } from "./api-error";
+import { ApiError, type ValidationErrorDetail } from "./api-error";
 import { logger } from "../logging/logger";
 import { resolveRequestId } from "../request-id";
 
