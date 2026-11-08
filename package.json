@@ -7,7 +7,7 @@
     "build": "next build --webpack",
     "start": "next start",
     "lint": "eslint",
-    "test": "node --loader ./tests/loader.mjs --experimental-transform-types --conditions=react-server --test tests/auth/session.test.ts"
+    "test": "node --loader ./tests/loader.mjs --experimental-transform-types --conditions=react-server --test \"tests/**/*.test.ts\""
   },
   "dependencies": {
     "@prisma/client": "^6.19.3",

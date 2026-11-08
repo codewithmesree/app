@@ -20,3 +20,27 @@ export const bankLinkCallbackSchema = z.object({
 
 export type BankLinkCallbackInput = z.infer<typeof bankLinkCallbackSchema>;
 
+/**
+ * Validates action requests for simulated bank linking:
+ * - "initiate": begin linking handshake
+ * - "complete": confirm linking (with optional simulation of failure)
+ * - "simulate_status": test transitional status (expired, reconnection)
+ */
+export const bankLinkActionSchema = z.discriminatedUnion("action", [
+  z.object({
+    action: z.literal("initiate"),
+    institutionId: z.string().trim().min(1, "Institution ID is required.").max(50),
+  }),
+  z.object({
+    action: z.literal("complete"),
+    institutionId: z.string().trim().min(1, "Institution ID is required.").max(50),
+    simulateFailure: z.boolean().default(false),
+    failureReason: z.string().max(200).optional(),
+  }),
+  z.object({
+    action: z.literal("simulate_status"),
+    status: z.enum(["connection_expired", "reconnection_required"]),
+  }),
+]);
+
+export type BankLinkActionInput = z.infer<typeof bankLinkActionSchema>;
