@@ -7,7 +7,12 @@
     "build": "next build --webpack",
     "start": "next start",
     "lint": "eslint",
+    "db:migrate": "prisma migrate deploy",
+    "db:seed": "prisma db seed",
     "test": "node --loader ./tests/loader.mjs --experimental-transform-types --conditions=react-server --test \"tests/**/*.test.ts\""
+  },
+  "prisma": {
+    "seed": "node --loader ./tests/loader.mjs --experimental-transform-types --conditions=react-server ./prisma/seed.ts"
   },
   "dependencies": {
     "@prisma/client": "^6.19.3",

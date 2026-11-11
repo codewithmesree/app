@@ -32,7 +32,7 @@ export async function GET(request: Request, props: RouteProps) {
         status: 200,
         headers: {
           "x-request-id": requestId,
-          "cache-control": "public, s-maxage=60, stale-while-revalidate=300",
+          "cache-control": "no-store",
         },
       }
     );
@@ -40,4 +40,3 @@ export async function GET(request: Request, props: RouteProps) {
     return handleApiError(error, request, requestId);
   }
 }
-

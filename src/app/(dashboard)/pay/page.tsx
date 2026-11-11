@@ -6,6 +6,12 @@ export const metadata: Metadata = {
   description: "Review test payment details and authorize checkout via linked bank account.",
 };
 
-export default function PayPage() {
-  return <PayPageClient />;
+export default async function PayPage({
+  searchParams,
+}: PageProps<"/pay">) {
+  const params = await searchParams;
+  const merchantId =
+    typeof params.merchantId === "string" ? params.merchantId : null;
+
+  return <PayPageClient merchantId={merchantId} />;
 }

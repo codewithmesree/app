@@ -12,7 +12,7 @@ export function WelcomeScreen() {
       <Reveal className="relative">
         <p className="label-mono inline-flex items-center gap-2.5 rounded-full border border-line bg-surface px-4 py-2 text-lavender">
           <span aria-hidden className="size-2 rounded-full bg-lavender ring-4 ring-lavender/25" />
-          AI-powered travel payments
+          International travel payment demo
         </p>
       </Reveal>
       <div className="relative flex w-full max-w-2xl flex-1 flex-col items-center justify-center gap-6 py-12">
@@ -28,8 +28,8 @@ export function WelcomeScreen() {
         </Reveal>
         <Reveal order={3}>
           <p className="max-w-lg text-base text-ink-muted sm:text-lg">
-            A prototype that helps travellers understand paying abroad, with indicative exchange rates, sample merchants
-            and an AI assistant.
+            A prototype for exploring indicative exchange estimates and sample merchants, with PayPal Sandbox checkout
+            and a read-only guidance FAQ.
           </p>
         </Reveal>
       </div>

@@ -51,6 +51,10 @@ export function redactSensitiveData(data: unknown, depth = 0): unknown {
     );
     // Redact Bearer tokens
     cleaned = cleaned.replace(/Bearer\s+[A-Za-z0-9._~+/-]+=*/gi, "Bearer [REDACTED]");
+    cleaned = cleaned.replace(
+      /((?:access[_-]?token|refresh[_-]?token|session[_-]?token|gp_session|client[_-]?secret|api[_-]?key|password|authorization)\s*[:=]\s*["']?)[^\s,"'};]+/gi,
+      "$1[REDACTED]"
+    );
     return cleaned;
   }
 
@@ -73,4 +77,3 @@ export function redactSensitiveData(data: unknown, depth = 0): unknown {
 
   return result;
 }
-

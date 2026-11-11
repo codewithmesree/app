@@ -32,6 +32,7 @@ type BankLinkingFlowViewProps = {
 export function BankLinkingFlowView({ returnTo = "/dashboard", contextNotice }: BankLinkingFlowViewProps) {
   const {
     state,
+    operationError,
     startLinking,
     completeLinking,
     failLinking,
@@ -46,21 +47,18 @@ export function BankLinkingFlowView({ returnTo = "/dashboard", contextNotice }: 
   function handleCompleteSimulatedHandoff() {
     setIsSimulatingProcessing(true);
     setTimeout(() => {
-      completeLinking({
-        institutionName: selectedBank.name,
-        maskedAccountNumber: selectedBank.maskedNumber,
-        accountType: selectedBank.accountType,
-        holderLabel: "Alex Traveller",
+      void completeLinking({ institutionId: selectedBank.id }).finally(() => {
+        setIsSimulatingProcessing(false);
       });
-      setIsSimulatingProcessing(false);
     }, 600);
   }
 
   function handleSimulateFailure() {
     setIsSimulatingProcessing(true);
     setTimeout(() => {
-      failLinking("Mock Open Banking provider returned verification error (SIMULATED_AUTH_TIMEOUT).");
-      setIsSimulatingProcessing(false);
+      void failLinking("Mock Open Banking provider returned verification error (SIMULATED_AUTH_TIMEOUT).").finally(
+        () => setIsSimulatingProcessing(false)
+      );
     }, 500);
   }
 
@@ -71,6 +69,7 @@ export function BankLinkingFlowView({ returnTo = "/dashboard", contextNotice }: 
         onContinue={startLinking}
         returnTo={returnTo}
         contextNotice={contextNotice}
+        operationError={operationError}
       />
     );
   }
@@ -79,6 +78,11 @@ export function BankLinkingFlowView({ returnTo = "/dashboard", contextNotice }: 
   if (state.status === "linking_in_progress") {
     return (
       <div className="mx-auto flex w-full max-w-2xl flex-col gap-6 py-4">
+        {operationError ? (
+          <Alert tone="danger" title="Bank connection was not updated">
+            {operationError}
+          </Alert>
+        ) : null}
         <Reveal>
           <div className="flex flex-col items-center text-center">
             <span className="grid size-12 place-items-center rounded-2xl bg-primary-soft text-lavender">
@@ -185,6 +189,11 @@ export function BankLinkingFlowView({ returnTo = "/dashboard", contextNotice }: 
   if (state.status === "linked" && state.account) {
     return (
       <div className="mx-auto flex w-full max-w-2xl flex-col gap-6 py-4">
+        {operationError ? (
+          <Alert tone="danger" title="Bank connection was not updated">
+            {operationError}
+          </Alert>
+        ) : null}
         <Reveal>
           <div className="flex flex-col items-center text-center">
             <span className="grid size-12 place-items-center rounded-2xl bg-success/20 text-success">
@@ -206,7 +215,7 @@ export function BankLinkingFlowView({ returnTo = "/dashboard", contextNotice }: 
           <Card className="flex flex-col gap-4">
             <div className="flex items-center justify-between border-b border-line pb-3">
               <h2 className="label-mono text-ink-muted">Linked account details</h2>
-              <Badge tone="success">Verified Mandate</Badge>
+              <Badge tone="success">Mock test mandate</Badge>
             </div>
 
             <dl className="grid grid-cols-1 gap-3 sm:grid-cols-2 text-sm">
@@ -271,6 +280,11 @@ export function BankLinkingFlowView({ returnTo = "/dashboard", contextNotice }: 
   if (state.status === "linking_failed") {
     return (
       <div className="mx-auto flex w-full max-w-2xl flex-col gap-6 py-4">
+        {operationError ? (
+          <Alert tone="danger" title="Bank connection was not updated">
+            {operationError}
+          </Alert>
+        ) : null}
         <Reveal>
           <div className="flex flex-col items-center text-center">
             <span className="grid size-12 place-items-center rounded-2xl bg-danger/20 text-danger">
@@ -318,6 +332,11 @@ export function BankLinkingFlowView({ returnTo = "/dashboard", contextNotice }: 
   if (state.status === "connection_expired") {
     return (
       <div className="mx-auto flex w-full max-w-2xl flex-col gap-6 py-4">
+        {operationError ? (
+          <Alert tone="danger" title="Bank connection was not updated">
+            {operationError}
+          </Alert>
+        ) : null}
         <Reveal>
           <div className="flex flex-col items-center text-center">
             <span className="grid size-12 place-items-center rounded-2xl bg-warning/20 text-warning">
@@ -372,6 +391,11 @@ export function BankLinkingFlowView({ returnTo = "/dashboard", contextNotice }: 
   // 6. Reconnection required state
   return (
     <div className="mx-auto flex w-full max-w-2xl flex-col gap-6 py-4">
+      {operationError ? (
+        <Alert tone="danger" title="Bank connection was not updated">
+          {operationError}
+        </Alert>
+      ) : null}
       <Reveal>
         <div className="flex flex-col items-center text-center">
           <span className="grid size-12 place-items-center rounded-2xl bg-warning/20 text-warning">
@@ -414,4 +438,3 @@ export function BankLinkingFlowView({ returnTo = "/dashboard", contextNotice }: 
     </div>
   );
 }
-

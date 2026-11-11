@@ -1,7 +1,7 @@
 "use client";
 
 import { ArrowDown, QrCode, Store } from "lucide-react";
-import { useId, useState } from "react";
+import { useEffect, useId, useState } from "react";
 import { Alert } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { ButtonLink } from "@/components/ui/button";
@@ -9,7 +9,6 @@ import { Card } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { getCurrency, type CurrencyCode } from "@/features/currency/currencies";
 import type { RateStatus } from "@/features/currency/currency-types";
-import { getSampleQuote, getSampleRate } from "@/features/currency/sample-quote";
 import { formatDateTimeUtc } from "@/lib/format-date";
 import { formatDecimal } from "@/lib/format-money";
 import { validateAmount } from "@/lib/validation/amount";
@@ -20,26 +19,100 @@ type IndicativeRateCardProps = {
   quoteCurrency: CurrencyCode;
 };
 
-export function IndicativeRateCard({ status, baseCurrency, quoteCurrency }: IndicativeRateCardProps) {
+interface ApiQuoteState {
+  rate: string;
+  source: string;
+  asOf: string;
+  stale: boolean;
+  status: "loading" | "ready" | "unavailable";
+}
+
+export function IndicativeRateCard({
+  status: initialStatus,
+  baseCurrency,
+  quoteCurrency,
+}: IndicativeRateCardProps) {
+  const [quoteState, setQuoteState] = useState<ApiQuoteState>({
+    rate: "",
+    source: "",
+    asOf: "",
+    stale: false,
+    status: initialStatus === "loading" ? "loading" : "loading",
+  });
+
+  useEffect(() => {
+    let isMounted = true;
+
+    // Fetch initial 1-unit indicative quote to discover current rate and status
+    fetch("/api/currency/quote", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        baseAmount: "1.00",
+        baseCurrency,
+        quoteCurrency,
+      }),
+    })
+      .then(async (res) => {
+        if (!res.ok) {
+          throw new Error(`Status ${res.status}`);
+        }
+        return res.json();
+      })
+      .then((data) => {
+        if (!isMounted) return;
+        if (data?.quote) {
+          setQuoteState({
+            rate: data.quote.rate,
+            source: data.quote.source,
+            asOf: data.quote.asOf,
+            stale: Boolean(data.quote.stale),
+            status: "ready",
+          });
+        } else {
+          setQuoteState((prev) => ({ ...prev, status: "unavailable" }));
+        }
+      })
+      .catch(() => {
+        if (!isMounted) return;
+        setQuoteState((prev) => ({ ...prev, status: "unavailable" }));
+      });
+
+    return () => {
+      isMounted = false;
+    };
+  }, [baseCurrency, quoteCurrency]);
+
+  const effectiveStatus = quoteState.status;
+
   return (
-    <Card aria-labelledby="rate-heading" aria-busy={status === "loading"} className="flex h-full flex-col gap-5">
+    <Card aria-labelledby="rate-heading" aria-busy={effectiveStatus === "loading"} className="flex h-full flex-col gap-5">
       <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1 border-b border-line pb-4">
-        <h2 id="rate-heading" className="label-mono text-ink-muted">
-          Indicative conversion
-        </h2>
-        {status === "ready" ? (
+        <div className="flex items-center gap-2">
+          <h2 id="rate-heading" className="label-mono text-ink-muted">
+            Indicative conversion
+          </h2>
+          {quoteState.stale ? <Badge tone="warning">Cached (Stale)</Badge> : null}
+        </div>
+        {effectiveStatus === "ready" ? (
           <p className="font-mono text-[13px] text-lavender">
-            Sample rate: 1 {baseCurrency} = {getSampleRate(baseCurrency, quoteCurrency)} {quoteCurrency}
+            Rate: 1 {baseCurrency} = {quoteState.rate} {quoteCurrency}
           </p>
         ) : null}
       </div>
-      {status === "loading" ? <ConversionSkeleton /> : null}
-      {status === "unavailable" ? (
+      {effectiveStatus === "loading" ? <ConversionSkeleton /> : null}
+      {effectiveStatus === "unavailable" ? (
         <Alert tone="warning" title="Rate unavailable">
           We couldn&rsquo;t refresh the exchange rate, so no estimate is shown. Try again once the rate source is back.
         </Alert>
       ) : null}
-      {status === "ready" ? <ConversionForm baseCurrency={baseCurrency} quoteCurrency={quoteCurrency} /> : null}
+      {effectiveStatus === "ready" ? (
+        <ConversionForm
+          baseCurrency={baseCurrency}
+          quoteCurrency={quoteCurrency}
+          rateInfo={quoteState}
+        />
+      ) : null}
       <div className="mt-auto flex flex-col gap-3 pt-1">
         <div className="grid grid-cols-1 gap-3 min-[400px]:grid-cols-2">
           <ButtonLink href="/pay" className="min-h-14 text-base">
@@ -57,14 +130,61 @@ export function IndicativeRateCard({ status, baseCurrency, quoteCurrency }: Indi
   );
 }
 
-function ConversionForm({ baseCurrency, quoteCurrency }: Omit<IndicativeRateCardProps, "status">) {
+function ConversionForm({
+  baseCurrency,
+  quoteCurrency,
+  rateInfo,
+}: {
+  baseCurrency: CurrencyCode;
+  quoteCurrency: CurrencyCode;
+  rateInfo: ApiQuoteState;
+}) {
   const { decimals } = getCurrency(baseCurrency);
   const [input, setInput] = useState(decimals === 0 ? "25000" : "250.00");
+  const [convertedAmount, setConvertedAmount] = useState<string | null>(null);
+  const [isCalculating, setIsCalculating] = useState(false);
   const id = useId();
   const errorId = `${id}-error`;
 
   const validation = validateAmount(input, baseCurrency, decimals);
-  const quote = validation.valid ? getSampleQuote(validation.amount, baseCurrency, quoteCurrency) : null;
+  const validatedAmount = validation.valid ? validation.amount : null;
+
+  useEffect(() => {
+    if (!validatedAmount) {
+      return;
+    }
+
+    let isMounted = true;
+    const timer = setTimeout(() => {
+      setIsCalculating(true);
+      fetch("/api/currency/quote", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          baseAmount: validatedAmount,
+          baseCurrency,
+          quoteCurrency,
+        }),
+      })
+        .then((res) => (res.ok ? res.json() : null))
+        .then((data) => {
+          if (!isMounted) return;
+          if (data?.quote) {
+            setConvertedAmount(data.quote.convertedAmount);
+          }
+          setIsCalculating(false);
+        })
+        .catch(() => {
+          if (!isMounted) return;
+          setIsCalculating(false);
+        });
+    }, 200);
+
+    return () => {
+      isMounted = false;
+      clearTimeout(timer);
+    };
+  }, [validatedAmount, baseCurrency, quoteCurrency]);
 
   return (
     <>
@@ -105,17 +225,18 @@ function ConversionForm({ baseCurrency, quoteCurrency }: Omit<IndicativeRateCard
             aria-labelledby={`${id}-estimate`}
             className="tabular mt-2 flex flex-wrap items-baseline justify-between gap-x-3 font-mono text-[28px] font-medium leading-tight text-lavender [overflow-wrap:anywhere] sm:text-4xl"
           >
-            <span className="min-w-0">{quote ? formatDecimal(quote.convertedAmount) : "—"}</span>
+            <span className="min-w-0">
+              {isCalculating ? "..." : convertedAmount ? formatDecimal(convertedAmount) : "—"}
+            </span>
             <span className="text-lg text-ink">{quoteCurrency}</span>
           </output>
         </div>
       </div>
-      {quote ? (
+      {rateInfo ? (
         <dl className="grid gap-2 text-[13px]">
-          <QuoteRow term="Fees">Unavailable until a provider confirms them</QuoteRow>
-          <QuoteRow term="Source">{quote.source}</QuoteRow>
+          <QuoteRow term="Source">{rateInfo.source}</QuoteRow>
           <QuoteRow term="As of">
-            <time dateTime={quote.asOf}>{formatDateTimeUtc(quote.asOf)}</time>
+            <time dateTime={rateInfo.asOf}>{formatDateTimeUtc(rateInfo.asOf)}</time>
           </QuoteRow>
         </dl>
       ) : null}

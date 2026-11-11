@@ -2,7 +2,6 @@
 
 import {
   ArrowRight,
-  Bot,
   HelpCircle,
   Lock,
   ShieldCheck,
@@ -27,25 +26,25 @@ const FAQ_ITEMS: FaqItem[] = [
     topic: "Payment Access",
     question: "Why do I need to connect a bank account to pay merchants?",
     answer:
-      "GlobalPay requires an authorized bank connection to confirm payment intent and initiate sandbox transactions. Explore features like currency estimates and merchant discovery do not require linking.",
+      "GlobalPay requires a simulated bank-linking status to create PayPal Sandbox demo orders. Currency estimates and merchant discovery do not require linking.",
   },
   {
     topic: "Security",
     question: "Does GlobalPay store my banking login password or PIN?",
     answer:
-      "No. GlobalPay never asks for, sees, or stores your bank credentials. In production, authorization is delegated to regulated Open Banking providers via OAuth tokens.",
+      "No. The prototype never requests bank credentials and does not connect to a real bank. Its institution and account details are mock data.",
   },
   {
-    topic: "AI Guardrails",
-    question: "Can the AI Assistant link my bank or approve payments for me?",
+    topic: "Payment Guardrails",
+    question: "Can GlobalPay link my bank or approve payments for me?",
     answer:
-      "No. Following our security model and AI guardrails, the AI assistant is strictly read-only and explanatory. It cannot initiate, link, approve, or capture payments.",
+      "No. This prototype provides a static, read-only FAQ rather than an integrated AI model. It cannot initiate, link, approve, or capture payments.",
   },
   {
     topic: "Currencies",
     question: "Are the exchange rates guaranteed market rates?",
     answer:
-      "No. All exchange rates displayed in GlobalPay are indicative estimates for demonstration. The final converted charge is determined by PayPal at checkout time.",
+      "No. All exchange rates displayed in GlobalPay are indicative estimates for demonstration. PayPal Sandbox may show a different conversion; no real charge is made.",
   },
 ];
 
@@ -53,25 +52,25 @@ export function AssistantClient() {
   const { isPaymentEligible, state } = useBankLinking();
   const [selectedTopic, setSelectedTopic] = useState<string>("All");
 
-  const topics = ["All", "Payment Access", "Security", "AI Guardrails", "Currencies"];
+  const topics = ["All", "Payment Access", "Security", "Payment Guardrails", "Currencies"];
   const filteredFaqs =
     selectedTopic === "All" ? FAQ_ITEMS : FAQ_ITEMS.filter((item) => item.topic === selectedTopic);
 
   return (
     <div className="flex flex-col gap-6">
       <PageHeader
-        title="AI Assistant & Guidance"
-        description="Read-only travel payment explanations and security guidance. The assistant cannot approve or mutate payments."
+        title="Travel Payment Guidance"
+        description="Prewritten, read-only travel payment explanations and security guidance. No AI model is connected."
         aside={
-          <Badge tone="info" icon={<Bot aria-hidden className="size-3.5" />}>
-            Read-Only Explanatory Assistant
+          <Badge tone="info" icon={<HelpCircle aria-hidden className="size-3.5" />}>
+            Static FAQ Guidance
           </Badge>
         }
       />
 
-      <Alert tone="info" title="AI Guardrail Notice">
-        In accordance with GlobalPay security policy, the AI assistant operates strictly within a read-only boundary.
-        It cannot execute bank linking, modify accounts, or approve payment transactions.
+      <Alert tone="info" title="Guidance is read-only">
+        This prototype displays prewritten explanations only. It has no integrated AI service and cannot execute bank
+        linking, modify accounts, or approve payment transactions.
       </Alert>
 
       {/* Account Status Card */}

@@ -31,7 +31,7 @@ class AppLogger {
   ): LogPayload {
     const payload: LogPayload = {
       level,
-      message,
+      message: redactSensitiveData(message) as string,
       timestamp: new Date().toISOString(),
     };
 
@@ -45,17 +45,17 @@ class AppLogger {
 
     if (meta?.error) {
       if (meta.error instanceof Error) {
-        payload.error = {
+        payload.error = redactSensitiveData({
           name: meta.error.name,
           message: meta.error.message,
           code: (meta.error as { code?: string }).code,
           stack: process.env.NODE_ENV === "production" ? undefined : meta.error.stack,
-        };
+        }) as LogPayload["error"];
       } else {
-        payload.error = {
+        payload.error = redactSensitiveData({
           name: "UnknownError",
           message: String(meta.error),
-        };
+        }) as LogPayload["error"];
       }
     }
 
@@ -99,4 +99,3 @@ class AppLogger {
 }
 
 export const logger = new AppLogger();
-

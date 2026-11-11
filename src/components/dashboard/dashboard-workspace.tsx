@@ -75,7 +75,7 @@ export function DashboardWorkspace({ rateStatus, notice }: DashboardWorkspacePro
             <TravelInfoCard country={destination} />
           </Reveal>
           <Reveal order={2}>
-            <SampleMerchantsCard country={destination} />
+            <SampleMerchantsCard key={destination} country={destination} />
           </Reveal>
         </div>
       </div>

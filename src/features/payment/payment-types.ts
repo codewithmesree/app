@@ -26,6 +26,29 @@ export type TransactionSummary = {
   updatedAt: string;
 };
 
+export type TransactionDetail = {
+  id: string;
+  merchant: {
+    name: string;
+    countryCode: string | null;
+  };
+  amount: string;
+  currency: string;
+  status: TransactionStatus;
+  indicativeEstimate?: {
+    homeCurrency: string;
+    estimatedHomeAmount: string;
+    rate: string;
+    asOf?: string;
+    baseCurrency?: string;
+    quoteCurrency?: string;
+  };
+  createdAt: string;
+  completedAt?: string;
+  providerCaptureId?: string;
+};
+
 export type TransactionsState =
   | { status: "loading" }
+  | { status: "error" }
   | { status: "ready"; items: TransactionSummary[] };

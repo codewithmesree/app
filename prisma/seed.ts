@@ -39,11 +39,10 @@ async function main() {
 }
 
 main()
-  .catch((e) => {
-    console.error("Seeding failed:", e);
-    process.exit(1);
+  .catch(() => {
+    console.error("Merchant seeding failed. Check DATABASE_URL and confirm migrations have been applied.");
+    process.exitCode = 1;
   })
   .finally(async () => {
     await db.$disconnect();
   });
-

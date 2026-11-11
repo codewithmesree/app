@@ -3,12 +3,12 @@
 import {
   createContext,
   useContext,
+  useCallback,
   useEffect,
   useMemo,
   useState,
   type ReactNode,
 } from "react";
-import { SAMPLE_LINKED_ACCOUNT } from "./bank-linking-mock-data";
 import {
   isPaymentEligible,
   type BankLinkingState,
@@ -18,13 +18,10 @@ import {
 
 type BankLinkingContextValue = {
   state: BankLinkingState;
+  operationError: string | null;
   isPaymentEligible: boolean;
   startLinking: (institutionId?: unknown) => Promise<void>;
-  completeLinking: (
-    accountOrOptions?:
-      | Partial<LinkedBankAccount>
-      | { institutionId?: string; account?: Partial<LinkedBankAccount> }
-  ) => Promise<void>;
+  completeLinking: (options?: { institutionId?: string }) => Promise<void>;
   failLinking: (reason?: string, institutionId?: string) => Promise<void>;
   expireConnection: () => Promise<void>;
   requireReconnection: () => Promise<void>;
@@ -36,6 +33,69 @@ type BankLinkingContextValue = {
 
 const BankLinkingContext = createContext<BankLinkingContextValue | null>(null);
 
+const BANK_STATUSES: readonly BankLinkingStatus[] = [
+  "not_linked",
+  "linking_in_progress",
+  "linked",
+  "linking_failed",
+  "connection_expired",
+  "reconnection_required",
+];
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function parseConnection(value: unknown): BankLinkingState {
+  if (!isRecord(value) || typeof value.status !== "string" || !BANK_STATUSES.includes(value.status as BankLinkingStatus)) {
+    throw new Error("The bank-connection response was invalid.");
+  }
+  if (value.account !== null && value.account !== undefined) {
+    if (
+      !isRecord(value.account) ||
+      typeof value.account.institutionName !== "string" ||
+      typeof value.account.maskedAccountNumber !== "string" ||
+      typeof value.account.accountType !== "string" ||
+      typeof value.account.linkedAt !== "string"
+    ) {
+      throw new Error("The bank-connection response was invalid.");
+    }
+  }
+  if (value.notice !== null && value.notice !== undefined && typeof value.notice !== "string") {
+    throw new Error("The bank-connection response was invalid.");
+  }
+
+  return {
+    status: value.status as BankLinkingStatus,
+    account: value.account == null ? null : (value.account as LinkedBankAccount),
+    notice: (value.notice as string | null | undefined) ?? null,
+    isSimulated: true,
+  };
+}
+
+async function getConnectionResponse(response: Response): Promise<BankLinkingState> {
+  const payload: unknown = await response.json();
+  if (!response.ok) {
+    const message =
+      isRecord(payload) &&
+      isRecord(payload.error) &&
+      typeof payload.error.message === "string"
+        ? payload.error.message
+        : "The bank-connection request could not be completed.";
+    throw new Error(message);
+  }
+  if (!isRecord(payload) || !("connection" in payload)) {
+    throw new Error("The bank-connection response was invalid.");
+  }
+  return parseConnection(payload.connection);
+}
+
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error
+    ? error.message
+    : "The bank-connection request could not be completed.";
+}
+
 const DEFAULT_STATE: BankLinkingState = {
   status: "not_linked",
   account: null,
@@ -45,51 +105,40 @@ const DEFAULT_STATE: BankLinkingState = {
 
 export function BankLinkingProvider({ children }: { children: ReactNode }) {
   const [state, setState] = useState<BankLinkingState>(DEFAULT_STATE);
+  const [operationError, setOperationError] = useState<string | null>(null);
 
-  // Fetch initial connection status from the server
-  const refreshStatus = async () => {
+  const refreshStatus = useCallback(async () => {
     try {
       const res = await fetch("/api/bank-connection", {
         method: "GET",
-        headers: { "Cache-Control": "no-cache" },
+        cache: "no-store",
       });
-      if (res.ok) {
-        const data = await res.json();
-        if (data?.connection) {
-          setState({
-            status: data.connection.status,
-            account: data.connection.account,
-            notice: data.connection.notice,
-            isSimulated: true,
-          });
-        }
-      }
-    } catch {
-      // Offline or network error: retain current memory state
+      setState(await getConnectionResponse(res));
+      setOperationError(null);
+    } catch (error) {
+      setOperationError(getErrorMessage(error));
     }
-  };
+  }, []);
 
   useEffect(() => {
-    let isMounted = true;
-    fetch("/api/bank-connection", {
+    let active = true;
+    void fetch("/api/bank-connection", {
       method: "GET",
-      headers: { "Cache-Control": "no-cache" },
+      cache: "no-store",
     })
-      .then((res) => (res.ok ? res.json() : null))
-      .then((data) => {
-        if (isMounted && data?.connection) {
-          setState({
-            status: data.connection.status,
-            account: data.connection.account,
-            notice: data.connection.notice,
-            isSimulated: true,
-          });
+      .then(getConnectionResponse)
+      .then((connection) => {
+        if (active) {
+          setState(connection);
+          setOperationError(null);
         }
       })
-      .catch(() => {});
+      .catch((error: unknown) => {
+        if (active) setOperationError(getErrorMessage(error));
+      });
 
     return () => {
-      isMounted = false;
+      active = false;
     };
   }, []);
 
@@ -97,11 +146,12 @@ export function BankLinkingProvider({ children }: { children: ReactNode }) {
     const validInstitutionId =
       typeof institutionId === "string" ? institutionId : "chase";
 
-    // Optimistic state
+    const previousState = state;
+    setOperationError(null);
     setState({
       status: "linking_in_progress",
       account: null,
-      notice: "Initiating simulated Open Banking handshake...",
+      notice: "Initiating simulated bank-linking handshake...",
       isSimulated: true,
     });
 
@@ -116,39 +166,16 @@ export function BankLinkingProvider({ children }: { children: ReactNode }) {
           institutionId: validInstitutionId,
         }),
       });
-
-      if (res.ok) {
-        const data = await res.json();
-        if (data?.connection) {
-          setState({
-            status: data.connection.status,
-            account: data.connection.account,
-            notice: data.connection.notice,
-            isSimulated: true,
-          });
-        }
-      }
-    } catch {
-      // Retain optimistic in-memory state on network error
+      setState(await getConnectionResponse(res));
+    } catch (error) {
+      setState(previousState);
+      setOperationError(getErrorMessage(error));
     }
   };
 
-  const completeLinking = async (
-    accountOrOptions?:
-      | Partial<LinkedBankAccount>
-      | { institutionId?: string; account?: Partial<LinkedBankAccount> }
-  ) => {
-    let institutionId = "chase";
-    let accountOverride: Partial<LinkedBankAccount> | undefined;
-
-    if (accountOrOptions) {
-      if ("institutionId" in accountOrOptions && accountOrOptions.institutionId) {
-        institutionId = accountOrOptions.institutionId;
-        accountOverride = accountOrOptions.account;
-      } else {
-        accountOverride = accountOrOptions as Partial<LinkedBankAccount>;
-      }
-    }
+  const completeLinking = async (options?: { institutionId?: string }) => {
+    const institutionId = options?.institutionId ?? "chase";
+    setOperationError(null);
 
     try {
       const res = await fetch("/api/bank-connection/link", {
@@ -162,42 +189,17 @@ export function BankLinkingProvider({ children }: { children: ReactNode }) {
           simulateFailure: false,
         }),
       });
-
-      if (res.ok) {
-        const data = await res.json();
-        if (data?.connection) {
-          setState({
-            status: data.connection.status,
-            account: data.connection.account,
-            notice: data.connection.notice,
-            isSimulated: true,
-          });
-          return;
-        }
-      }
-    } catch {
-      // Fallback to local state if offline
+      setState(await getConnectionResponse(res));
+    } catch (error) {
+      setOperationError(getErrorMessage(error));
     }
-
-    // Fallback local update
-    setState({
-      status: "linked",
-      account: {
-        institutionName: accountOverride?.institutionName ?? SAMPLE_LINKED_ACCOUNT.institutionName,
-        maskedAccountNumber: accountOverride?.maskedAccountNumber ?? SAMPLE_LINKED_ACCOUNT.maskedAccountNumber,
-        accountType: accountOverride?.accountType ?? SAMPLE_LINKED_ACCOUNT.accountType,
-        holderLabel: accountOverride?.holderLabel ?? SAMPLE_LINKED_ACCOUNT.holderLabel,
-        linkedAt: new Date().toISOString(),
-      },
-      notice: null,
-      isSimulated: true,
-    });
   };
 
   const failLinking = async (reason?: string, institutionId = "chase") => {
     const errorMsg =
       reason ?? "Simulated bank verification timeout. No funds or credentials were transmitted.";
 
+    setOperationError(null);
     try {
       const res = await fetch("/api/bank-connection/link", {
         method: "POST",
@@ -211,32 +213,14 @@ export function BankLinkingProvider({ children }: { children: ReactNode }) {
           failureReason: errorMsg,
         }),
       });
-
-      if (res.ok) {
-        const data = await res.json();
-        if (data?.connection) {
-          setState({
-            status: data.connection.status,
-            account: null,
-            notice: data.connection.notice,
-            isSimulated: true,
-          });
-          return;
-        }
-      }
-    } catch {
-      // Fallback
+      setState(await getConnectionResponse(res));
+    } catch (error) {
+      setOperationError(getErrorMessage(error));
     }
-
-    setState({
-      status: "linking_failed",
-      account: null,
-      notice: errorMsg,
-      isSimulated: true,
-    });
   };
 
   const expireConnection = async () => {
+    setOperationError(null);
     try {
       const res = await fetch("/api/bank-connection/link", {
         method: "POST",
@@ -248,32 +232,14 @@ export function BankLinkingProvider({ children }: { children: ReactNode }) {
           status: "connection_expired",
         }),
       });
-
-      if (res.ok) {
-        const data = await res.json();
-        if (data?.connection) {
-          setState({
-            status: data.connection.status,
-            account: data.connection.account,
-            notice: data.connection.notice,
-            isSimulated: true,
-          });
-          return;
-        }
-      }
-    } catch {
-      // Fallback
+      setState(await getConnectionResponse(res));
+    } catch (error) {
+      setOperationError(getErrorMessage(error));
     }
-
-    setState((prev) => ({
-      status: "connection_expired",
-      account: prev.account ?? SAMPLE_LINKED_ACCOUNT,
-      notice: "Simulated bank authorization token has expired.",
-      isSimulated: true,
-    }));
   };
 
   const requireReconnection = async () => {
+    setOperationError(null);
     try {
       const res = await fetch("/api/bank-connection/link", {
         method: "POST",
@@ -285,59 +251,22 @@ export function BankLinkingProvider({ children }: { children: ReactNode }) {
           status: "reconnection_required",
         }),
       });
-
-      if (res.ok) {
-        const data = await res.json();
-        if (data?.connection) {
-          setState({
-            status: data.connection.status,
-            account: data.connection.account,
-            notice: data.connection.notice,
-            isSimulated: true,
-          });
-          return;
-        }
-      }
-    } catch {
-      // Fallback
+      setState(await getConnectionResponse(res));
+    } catch (error) {
+      setOperationError(getErrorMessage(error));
     }
-
-    setState((prev) => ({
-      status: "reconnection_required",
-      account: prev.account ?? SAMPLE_LINKED_ACCOUNT,
-      notice: "Simulated security policy requires re-authentication.",
-      isSimulated: true,
-    }));
   };
 
   const disconnect = async () => {
+    setOperationError(null);
     try {
       const res = await fetch("/api/bank-connection", {
         method: "DELETE",
       });
-
-      if (res.ok) {
-        const data = await res.json();
-        if (data?.connection) {
-          setState({
-            status: data.connection.status,
-            account: null,
-            notice: data.connection.notice,
-            isSimulated: true,
-          });
-          return;
-        }
-      }
-    } catch {
-      // Fallback
+      setState(await getConnectionResponse(res));
+    } catch (error) {
+      setOperationError(getErrorMessage(error));
     }
-
-    setState({
-      status: "not_linked",
-      account: null,
-      notice: "Bank account disconnected. Switched to explore-only mode.",
-      isSimulated: true,
-    });
   };
 
   const resetToUnlinked = async () => {
@@ -370,6 +299,7 @@ export function BankLinkingProvider({ children }: { children: ReactNode }) {
   const value = useMemo(
     () => ({
       state,
+      operationError,
       isPaymentEligible: isPaymentEligible(state.status),
       startLinking,
       completeLinking,
@@ -382,7 +312,7 @@ export function BankLinkingProvider({ children }: { children: ReactNode }) {
       refreshStatus,
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [state]
+    [state, operationError]
   );
 
   return <BankLinkingContext.Provider value={value}>{children}</BankLinkingContext.Provider>;

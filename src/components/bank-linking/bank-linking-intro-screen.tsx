@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 import Link from "next/link";
 import { Reveal } from "@/components/motion/reveal";
+import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 
 type BankLinkingIntroScreenProps = {
@@ -20,15 +21,22 @@ type BankLinkingIntroScreenProps = {
   returnTo?: string;
   /** Context header explaining why this screen appeared (e.g., when attempting to pay). */
   contextNotice?: string;
+  operationError?: string | null;
 };
 
 export function BankLinkingIntroScreen({
   onContinue,
   returnTo = "/dashboard",
   contextNotice,
+  operationError,
 }: BankLinkingIntroScreenProps) {
   return (
     <div className="mx-auto flex w-full max-w-3xl flex-col gap-6 py-4">
+      {operationError ? (
+        <Alert tone="danger" title="Bank connection was not updated">
+          {operationError}
+        </Alert>
+      ) : null}
       {contextNotice ? (
         <Reveal>
           <div className="flex items-center gap-3 rounded-card border border-warning/30 bg-warning/10 p-4 text-warning">
@@ -43,20 +51,20 @@ export function BankLinkingIntroScreen({
         <Reveal>
           <p className="label-mono inline-flex items-center gap-2 rounded-full border border-line bg-surface-raised px-3.5 py-1.5 text-lavender">
             <ShieldCheck aria-hidden className="size-4 text-lavender" />
-            Secure Open-Banking Connection
+            Simulated bank connection
           </p>
         </Reveal>
 
         <Reveal order={1}>
           <h1 className="mt-4 text-2xl font-semibold tracking-tight text-ink sm:text-3xl lg:text-4xl">
-            Connect your bank account
+            Connect a mock bank account
           </h1>
         </Reveal>
 
         <Reveal order={2}>
           <p className="mt-3 max-w-xl text-sm text-ink-muted sm:text-base">
-            To pay merchants and test international checkout flows in GlobalPay, a connected bank account is
-            required to authorize payment mandates.
+            To create PayPal Sandbox demo orders, GlobalPay requires a simulated bank-linking status. No real bank
+            account is accessed.
           </p>
         </Reveal>
       </div>
@@ -68,10 +76,9 @@ export function BankLinkingIntroScreen({
             <span className="grid size-9 place-items-center rounded-control bg-primary-soft text-lavender">
               <KeyRound aria-hidden className="size-4" />
             </span>
-            <h3 className="text-sm font-semibold text-ink">Zero Credential Access</h3>
+            <h3 className="text-sm font-semibold text-ink">No Bank Credentials</h3>
             <p className="text-[13px] leading-relaxed text-ink-muted">
-              We never request, see, or store your bank password, PIN, or OTPs. Linking is conducted via external
-              regulated banking handshakes.
+              The demo never requests or stores a bank password, PIN, OTP, or real account number.
             </p>
           </div>
 
@@ -81,8 +88,8 @@ export function BankLinkingIntroScreen({
             </span>
             <h3 className="text-sm font-semibold text-ink">Masked Privacy</h3>
             <p className="text-[13px] leading-relaxed text-ink-muted">
-              Only safely masked identifiers (e.g. &bull;&bull;&bull;&bull; 4821) and cryptographic access tokens are
-              exchanged. Full account numbers remain private.
+              The interface displays mock institution and masked account details. No real account data or banking token
+              is exchanged.
             </p>
           </div>
 
@@ -104,9 +111,8 @@ export function BankLinkingIntroScreen({
         <div className="rounded-card border border-line bg-surface-raised p-5">
           <h2 className="text-sm font-semibold text-ink">Why is linking required for payments?</h2>
           <p className="mt-2 text-[13px] leading-relaxed text-ink-muted">
-            GlobalPay verifies traveller authorization with your banking institution before initiating merchant
-            transactions. In this hackathon milestone, connecting establishes a simulated open-banking mandate so you
-            can test PayPal Sandbox checkout without using real money.
+            In this prototype, connecting updates a simulated eligibility record used to gate PayPal Sandbox demo
+            orders. It does not verify authorization with a bank or move money.
           </p>
         </div>
       </Reveal>
@@ -119,7 +125,7 @@ export function BankLinkingIntroScreen({
             onClick={onContinue}
             className="min-h-13 w-full max-w-md text-base sm:min-h-14"
           >
-            Continue to secure bank linking
+            Continue to mock bank linking
             <ArrowRight aria-hidden className="size-5 shrink-0" />
           </Button>
 
@@ -132,11 +138,10 @@ export function BankLinkingIntroScreen({
 
           <p className="flex items-center gap-2 pt-2 text-center text-xs text-warning">
             <FlaskConical aria-hidden className="size-3.5 shrink-0" />
-            Frontend milestone: Bank linking is simulated with mock sandbox credentials.
+            Demo limitation: Bank linking is simulated; no real banking integration is present.
           </p>
         </div>
       </Reveal>
     </div>
   );
 }
-

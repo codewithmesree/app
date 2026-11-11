@@ -4,6 +4,7 @@ export const merchantListQuerySchema = z.object({
   countryCode: z.string().trim().length(2).toUpperCase().optional(),
   category: z.string().trim().max(40).toLowerCase().optional(),
   currency: z.string().trim().length(3).toUpperCase().optional(),
+  demoQrOnly: z.literal("true").optional(),
   limit: z.coerce.number().int().min(1).max(50).default(20),
   cursor: z.string().trim().max(50).optional(),
 });

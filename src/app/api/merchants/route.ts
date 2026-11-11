@@ -26,6 +26,7 @@ export async function GET(request: Request) {
       countryCode: searchParams.get("countryCode") ?? undefined,
       category: searchParams.get("category") ?? undefined,
       currency: searchParams.get("currency") ?? undefined,
+      demoQrOnly: searchParams.get("demoQrOnly") ?? undefined,
       limit: searchParams.get("limit") ?? undefined,
       cursor: searchParams.get("cursor") ?? undefined,
     };
@@ -52,4 +53,3 @@ export async function GET(request: Request) {
     return handleApiError(error, request, requestId);
   }
 }
-

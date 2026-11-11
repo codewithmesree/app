@@ -100,7 +100,9 @@ export function DestinationsStep({ homeCountry, value, onToggle }: DestinationsS
         ))}
         <ResultCount count={countries.length} noun="destination" emptyMessage="No destination matches. Try another search or region." />
       </fieldset>
-      <Alert title="Sample rates">These fixed rates are for the demo only. They aren&rsquo;t live or market rates.</Alert>
+      <Alert title="Indicative rates">
+        Destination cards show sample estimates. Current indicative reference quotes from Frankfurter / ECB are available on the rates and payment screens; they are not guaranteed checkout rates.
+      </Alert>
     </div>
   );
 }

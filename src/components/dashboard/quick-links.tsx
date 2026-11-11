@@ -1,4 +1,4 @@
-import { Bot, ChevronRight, Store, type LucideIcon } from "lucide-react";
+import { ChevronRight, HelpCircle, Store, type LucideIcon } from "lucide-react";
 import Link from "next/link";
 import { SectionHeader } from "@/components/ui/section-header";
 
@@ -12,9 +12,9 @@ const LINKS: { href: string; title: string; description: string; icon: LucideIco
   },
   {
     href: "/assistant",
-    title: "AI Assistant",
-    description: "Ask what a rate or payment status means. It can’t approve payments.",
-    icon: Bot,
+    title: "Travel guidance",
+    description: "Read answers about sample rates, payment status, and prototype limits.",
+    icon: HelpCircle,
   },
 ];
 

@@ -3,11 +3,12 @@
 import { ArrowRight, ChevronRight, Landmark } from "lucide-react";
 import Link from "next/link";
 import { ButtonLink } from "@/components/ui/button";
+import { Alert } from "@/components/ui/alert";
 import { useBankLinking } from "@/features/bank-linking/bank-linking-context";
 import { BankLinkingBadge } from "./bank-linking-badge";
 
 export function BankLinkingStatusBanner() {
-  const { state } = useBankLinking();
+  const { state, operationError } = useBankLinking();
   const { status, account } = state;
 
   return (
@@ -16,6 +17,11 @@ export function BankLinkingStatusBanner() {
       aria-label="Bank account linking status"
       className="flex flex-col gap-3 rounded-card border border-line bg-surface p-4 transition-colors duration-150 sm:flex-row sm:items-center sm:justify-between"
     >
+      {operationError ? (
+        <Alert tone="danger" title="Bank connection was not updated">
+          {operationError}
+        </Alert>
+      ) : null}
       <div className="flex items-start gap-3.5 min-w-0">
         <span className="grid size-9 shrink-0 place-items-center rounded-control border border-line bg-surface-muted text-ink-muted">
           <Landmark aria-hidden className="size-4" />
@@ -104,4 +110,3 @@ export function BankLinkingStatusBanner() {
     </div>
   );
 }
-

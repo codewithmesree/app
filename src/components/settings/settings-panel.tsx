@@ -16,11 +16,16 @@ import { formatDateTimeUtc } from "@/lib/format-date";
 
 export function SettingsPanel() {
   const { preferences } = useTravellerPreferences();
-  const { state, disconnect } = useBankLinking();
+  const { state, operationError, disconnect } = useBankLinking();
   const { status, account } = state;
 
   return (
     <div className="flex flex-col gap-6">
+      {operationError ? (
+        <Alert tone="danger" title="Bank connection was not updated">
+          {operationError}
+        </Alert>
+      ) : null}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2 lg:gap-6">
         {/* Bank Connection Section (Requirement 6) */}
         <Reveal>
@@ -158,7 +163,9 @@ export function SettingsPanel() {
             ) : (
               <p className="text-sm text-ink-muted">You haven&rsquo;t set up a trip yet.</p>
             )}
-            <p className="text-[13px] text-ink-muted">Preferences aren&rsquo;t saved yet, so refreshing the page clears them.</p>
+            <p className="text-[13px] text-ink-muted">
+              Preferences are saved to this anonymous demo session and restored while its session cookie remains valid.
+            </p>
             <ButtonLink href="/onboarding" variant="secondary" className="mt-auto self-start">
               {preferences ? "Change preferences" : "Set up your trip"}
             </ButtonLink>
@@ -180,8 +187,9 @@ export function SettingsPanel() {
               PayPal Sandbox is used. No real money will move.
             </Alert>
             <p className="text-sm text-ink-muted">
-              Currency conversions are estimates, not guaranteed final rates. The rates shown today are fixed sample values,
-              not market data. Bank linking is simulated for this frontend milestone; no actual banking credentials are stored.
+              Currency conversions are indicative estimates from European Central Bank reference data via Frankfurter.
+              They are not guaranteed final rates or the amount PayPal may use at checkout. Bank linking is simulated;
+              no actual banking credentials are stored.
             </p>
           </Card>
         </Reveal>

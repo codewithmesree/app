@@ -4,7 +4,7 @@ import { ArrowLeft, ArrowRight } from "lucide-react";
 import { motion } from "motion/react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useReducer, type ReactNode } from "react";
+import { useReducer, useState, type ReactNode } from "react";
 import { Button } from "@/components/ui/button";
 import {
   createOnboardingState,
@@ -40,8 +40,9 @@ export function OnboardingFlow() {
   const router = useRouter();
   const { preferences, savePreferences } = useTravellerPreferences();
   const [state, dispatch] = useReducer(onboardingReducer, preferences, createOnboardingState);
+  const [isSaving, setIsSaving] = useState(false);
 
-  function handleContinue() {
+  async function handleContinue() {
     const message = getStepError(state);
     if (message) {
       dispatch({ type: "show-error", message });
@@ -53,8 +54,21 @@ export function OnboardingFlow() {
     }
     const completed = toPreferences(state);
     if (completed) {
-      savePreferences(completed);
-      router.push("/dashboard");
+      setIsSaving(true);
+      try {
+        await savePreferences(completed);
+        router.push("/dashboard");
+      } catch (error) {
+        dispatch({
+          type: "show-error",
+          message:
+            error instanceof Error
+              ? error.message
+              : "Your trip preferences could not be saved. Please try again.",
+        });
+      } finally {
+        setIsSaving(false);
+      }
     }
   }
 
@@ -129,8 +143,13 @@ export function OnboardingFlow() {
                 {state.error}
               </p>
             ) : null}
-            <Button variant="accent" onClick={handleContinue} className="min-h-14 w-full text-base">
-              {getContinueLabel(state)}
+            <Button
+              variant="accent"
+              onClick={handleContinue}
+              disabled={isSaving}
+              className="min-h-14 w-full text-base"
+            >
+              {isSaving ? "Saving preferences…" : getContinueLabel(state)}
               <ArrowRight aria-hidden className="size-5 shrink-0" />
             </Button>
             {state.step === 3 ? (

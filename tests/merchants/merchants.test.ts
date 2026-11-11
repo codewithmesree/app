@@ -18,6 +18,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { db } from "../../src/lib/db";
 import {
+  DEMO_MERCHANTS_SEED_DATA,
   seedDemoMerchants,
   listMerchants,
 } from "../../src/lib/merchants/merchant-service";
@@ -28,14 +29,18 @@ test("Merchant Seeding: is idempotent and creates consistent row count", async (
   const count1 = await seedDemoMerchants();
   assert.ok(count1 >= 15, "Initial seed should create at least 15 merchants");
 
-  const totalInDb = await db.merchant.count();
+  const totalInDb = await db.merchant.count({
+    where: { slug: { in: DEMO_MERCHANTS_SEED_DATA.map(({ slug }) => slug) } },
+  });
   assert.equal(totalInDb, count1);
 
   // Run seed second time — must not create duplicate rows
   const count2 = await seedDemoMerchants();
   assert.equal(count2, count1);
 
-  const totalAfterSecondSeed = await db.merchant.count();
+  const totalAfterSecondSeed = await db.merchant.count({
+    where: { slug: { in: DEMO_MERCHANTS_SEED_DATA.map(({ slug }) => slug) } },
+  });
   assert.equal(totalAfterSecondSeed, totalInDb, "Total count in DB must remain identical");
 });
 
@@ -57,6 +62,7 @@ test("Merchant Discovery API: GET /api/merchants returns active catalogue", asyn
   assert.ok(sample.name);
   assert.ok(sample.category);
   assert.equal(sample.isDemo, true);
+  assert.ok(sample.demoQrIdentifier, "Demo merchant summaries expose their QR identifier");
 });
 
 test("Merchant Filtering: countryCode query parameter filters accurately", async () => {
