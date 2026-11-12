@@ -6,6 +6,7 @@ import { seedDemoMerchants } from "@/lib/merchants/merchant-service";
 import { transactionService } from "@/lib/payments/transaction-service";
 import { PayPalPaymentService } from "@/lib/payments/paypal-payment-service";
 import {
+  PayPalCaptureError,
   PayPalClient,
   PayPalOrderCreationError,
   PayPalOrderNotFoundError,
@@ -1257,5 +1258,439 @@ describe("Phase 6: PayPal Sandbox Payment Lifecycle", () => {
     const stored = await db.transaction.findUnique({ where: { id: txn.id } });
     assert.strictEqual(stored?.amount.toString(), "25000");
     assert.strictEqual(stored?.currency, "JPY");
+  });
+
+  // ---------------------------------------------------------------------------
+  // Automatic confirmation: post-capture order inquiry and definitive failures
+  // ---------------------------------------------------------------------------
+
+  /** Simulates PayPal's order record holding one capture in the given state. */
+  function settleOrder(captureId: string, status: string) {
+    mockClient.orderStatus = status === "PENDING" ? "APPROVED" : "COMPLETED";
+    mockClient.capturesList = [{ id: captureId, status, amount: "25000", currency: "JPY" }];
+  }
+
+  it("40. capture response without payee (real PayPal shape) is proven COMPLETED by order inquiry in the same request", async () => {
+    const { session, txn } = await createAwaitingOrder("no_payee_capture");
+    const captureId = `REAL_SHAPE_CAPTURE_${txn.id}`;
+    mockClient.captureOrder = async (_orderId: string, requestId?: string) => {
+      mockClient.captureCalls++;
+      mockClient.lastCaptureRequestId = requestId;
+      settleOrder(captureId, "COMPLETED");
+      return { captureId, status: "COMPLETED", amount: "25000", currency: "JPY" }; // no payee
+    };
+
+    const result = await paymentService.capturePayPalOrder(session.id, {
+      transactionId: txn.id,
+      idempotencyKey: `capture_${txn.id}`,
+    });
+
+    assert.strictEqual(result.status, "COMPLETED");
+    assert.strictEqual(result.providerCaptureId, captureId);
+    assert.strictEqual(mockClient.captureCalls, 1);
+    assert.strictEqual(mockClient.getOrderCalls, 2); // pre-capture check + post-capture proof
+    const stored = await db.transaction.findUnique({ where: { id: txn.id }, include: { paymentAttempts: true } });
+    assert.strictEqual(stored?.status, TransactionStatus.COMPLETED);
+    assert.strictEqual(stored?.paymentAttempts[0].status, "COMPLETED");
+    assert.strictEqual(stored?.paymentAttempts[0].reconciliationNeeded, false);
+    assert.strictEqual(stored?.paymentAttempts[0].captureLeaseToken, null);
+    const uncertain = await db.transactionEvent.count({
+      where: { transactionId: txn.id, eventType: "CAPTURE_VERIFICATION_UNCERTAIN" },
+    });
+    assert.strictEqual(uncertain, 0);
+    const completedEvent = await db.transactionEvent.findFirst({
+      where: { transactionId: txn.id, eventType: "PAYPAL_CAPTURE_COMPLETED" },
+    });
+    assert.strictEqual((completedEvent?.metadata as { verifiedVia?: string })?.verifiedVia, "ORDER_INQUIRY");
+  });
+
+  it("41. capture timeout after PayPal already captured confirms COMPLETED without a second capture", async () => {
+    const { session, txn } = await createAwaitingOrder("timeout_but_captured");
+    const captureId = `TIMEOUT_CAPTURE_${txn.id}`;
+    mockClient.captureOrder = async () => {
+      mockClient.captureCalls++;
+      settleOrder(captureId, "COMPLETED");
+      throw new Error("PAYPAL_TIMEOUT");
+    };
+
+    const result = await paymentService.capturePayPalOrder(session.id, {
+      transactionId: txn.id,
+      idempotencyKey: `capture_${txn.id}`,
+    });
+    assert.strictEqual(result.status, "COMPLETED");
+    assert.strictEqual(result.providerCaptureId, captureId);
+    assert.strictEqual(mockClient.captureCalls, 1);
+  });
+
+  it("42. capture timeout before PayPal reflects it stays uncertain (never FAILED) and the next check reconciles to COMPLETED", async () => {
+    const { session, txn } = await createAwaitingOrder("timeout_then_reconcile");
+    mockClient.captureOrder = async () => {
+      mockClient.captureCalls++;
+      throw new Error("PAYPAL_TIMEOUT");
+    };
+    const key = `capture_${txn.id}`;
+
+    const first = await paymentService.capturePayPalOrder(session.id, { transactionId: txn.id, idempotencyKey: key });
+    assert.strictEqual(first.status, "STATUS_UNKNOWN");
+    const pending = await db.transaction.findUnique({ where: { id: txn.id } });
+    assert.strictEqual(pending?.status, TransactionStatus.STATUS_UNKNOWN);
+
+    // PayPal finishes processing; the return page's automatic poll reuses the same key.
+    settleOrder(`LATE_CAPTURE_${txn.id}`, "COMPLETED");
+    const second = await paymentService.capturePayPalOrder(session.id, { transactionId: txn.id, idempotencyKey: key });
+    assert.strictEqual(second.status, "COMPLETED");
+    assert.strictEqual(second.providerCaptureId, `LATE_CAPTURE_${txn.id}`);
+    assert.strictEqual(mockClient.captureCalls, 1);
+
+    // Further polls replay the stored result without touching PayPal.
+    const getOrderCallsBefore = mockClient.getOrderCalls;
+    const third = await paymentService.capturePayPalOrder(session.id, { transactionId: txn.id, idempotencyKey: key });
+    assert.strictEqual(third.status, "COMPLETED");
+    assert.strictEqual(mockClient.getOrderCalls, getOrderCallsBefore);
+    assert.strictEqual(mockClient.captureCalls, 1);
+  });
+
+  it("43. PayPal PENDING capture stays uncertain and later reconciles when PayPal completes it", async () => {
+    const { session, txn } = await createAwaitingOrder("pending_capture");
+    const captureId = `PENDING_CAPTURE_${txn.id}`;
+    mockClient.captureOrder = async () => {
+      mockClient.captureCalls++;
+      settleOrder(captureId, "PENDING");
+      return { captureId, status: "PENDING", amount: "25000", currency: "JPY" };
+    };
+    const key = `capture_${txn.id}`;
+
+    const first = await paymentService.capturePayPalOrder(session.id, { transactionId: txn.id, idempotencyKey: key });
+    assert.strictEqual(first.status, "STATUS_UNKNOWN");
+    const attemptPending = await db.paymentAttempt.findFirst({ where: { transactionId: txn.id } });
+    assert.strictEqual(attemptPending?.status, "STATUS_UNKNOWN");
+
+    settleOrder(captureId, "COMPLETED");
+    const second = await paymentService.capturePayPalOrder(session.id, { transactionId: txn.id, idempotencyKey: key });
+    assert.strictEqual(second.status, "COMPLETED");
+    assert.strictEqual(second.providerCaptureId, captureId);
+    assert.strictEqual(mockClient.captureCalls, 1);
+  });
+
+  it("44. PayPal DECLINED capture is recorded as FAILED and can never be re-captured", async () => {
+    const { session, txn } = await createAwaitingOrder("declined_capture");
+    const captureId = `DECLINED_CAPTURE_${txn.id}`;
+    mockClient.captureOrder = async () => {
+      mockClient.captureCalls++;
+      settleOrder(captureId, "DECLINED");
+      return { captureId, status: "DECLINED", amount: "25000", currency: "JPY" };
+    };
+    const key = `capture_${txn.id}`;
+
+    const result = await paymentService.capturePayPalOrder(session.id, { transactionId: txn.id, idempotencyKey: key });
+    assert.strictEqual(result.status, "FAILED");
+    const stored = await db.transaction.findUnique({ where: { id: txn.id }, include: { paymentAttempts: true } });
+    assert.strictEqual(stored?.status, TransactionStatus.FAILED);
+    assert.strictEqual(stored?.failureCode, "CAPTURE_DECLINED");
+    assert.strictEqual(stored?.completedAt, null);
+    assert.strictEqual(stored?.paymentAttempts[0].status, "DENIED");
+    assert.strictEqual(stored?.paymentAttempts[0].captureLeaseToken, null);
+
+    await assert.rejects(
+      () => paymentService.capturePayPalOrder(session.id, { transactionId: txn.id, idempotencyKey: key }),
+      (err: unknown) => err instanceof ApiError && err.code === "TRANSACTION_STATE_CONFLICT"
+    );
+    assert.strictEqual(mockClient.captureCalls, 1);
+  });
+
+  it("45. recovery that finds a FAILED capture on PayPal records FAILED", async () => {
+    const { session, txn } = await createAwaitingOrder("failed_recovery");
+    mockClient.captureOrder = async () => {
+      mockClient.captureCalls++;
+      throw new Error("PAYPAL_TIMEOUT");
+    };
+    const key = `capture_${txn.id}`;
+    const first = await paymentService.capturePayPalOrder(session.id, { transactionId: txn.id, idempotencyKey: key });
+    assert.strictEqual(first.status, "STATUS_UNKNOWN");
+
+    settleOrder(`FAILED_CAPTURE_${txn.id}`, "FAILED");
+    const second = await paymentService.capturePayPalOrder(session.id, { transactionId: txn.id, idempotencyKey: key });
+    assert.strictEqual(second.status, "FAILED");
+    const stored = await db.transaction.findUnique({ where: { id: txn.id }, include: { paymentAttempts: true } });
+    assert.strictEqual(stored?.status, TransactionStatus.FAILED);
+    assert.strictEqual(stored?.paymentAttempts[0].status, "FAILED");
+    assert.strictEqual(mockClient.captureCalls, 1);
+  });
+
+  it("46. a capture response naming a different payee fails closed without being recovered by inquiry", async () => {
+    const { session, txn } = await createAwaitingOrder("conflicting_capture_payee");
+    const captureId = `PAYEE_CONFLICT_${txn.id}`;
+    mockClient.captureOrder = async () => {
+      mockClient.captureCalls++;
+      settleOrder(captureId, "COMPLETED");
+      return { captureId, status: "COMPLETED", amount: "25000", currency: "JPY", payeeEmail: "attacker@evil.test" };
+    };
+
+    const result = await paymentService.capturePayPalOrder(session.id, {
+      transactionId: txn.id,
+      idempotencyKey: `capture_${txn.id}`,
+    });
+    assert.strictEqual(result.status, "STATUS_UNKNOWN");
+    assert.strictEqual(mockClient.getOrderCalls, 1); // only the pre-capture check
+    const stored = await db.transaction.findUnique({ where: { id: txn.id } });
+    assert.strictEqual(stored?.status, TransactionStatus.STATUS_UNKNOWN);
+  });
+
+  it("47. order inquiry showing a different capture ID than PayPal returned stays uncertain", async () => {
+    const { session, txn } = await createAwaitingOrder("capture_id_mismatch");
+    mockClient.captureOrder = async () => {
+      mockClient.captureCalls++;
+      settleOrder(`OTHER_CAPTURE_${txn.id}`, "COMPLETED");
+      return { captureId: `RETURNED_CAPTURE_${txn.id}`, status: "COMPLETED", amount: "25000", currency: "JPY" };
+    };
+
+    const result = await paymentService.capturePayPalOrder(session.id, {
+      transactionId: txn.id,
+      idempotencyKey: `capture_${txn.id}`,
+    });
+    assert.strictEqual(result.status, "STATUS_UNKNOWN");
+    const stored = await db.transaction.findUnique({ where: { id: txn.id } });
+    assert.notStrictEqual(stored?.status, TransactionStatus.COMPLETED);
+  });
+
+  it("48. concurrent same-key capture requests capture once and create no duplicate records", async () => {
+    const { session, txn } = await createAwaitingOrder("duplicate_same_key");
+    let startCapture!: () => void;
+    let releaseCapture!: () => void;
+    const captureStarted = new Promise<void>((resolve) => { startCapture = resolve; });
+    mockClient.captureGate = new Promise<void>((resolve) => { releaseCapture = resolve; });
+    mockClient.onCapture = startCapture;
+    const key = `capture_${txn.id}`;
+
+    const first = paymentService.capturePayPalOrder(session.id, { transactionId: txn.id, idempotencyKey: key });
+    await captureStarted;
+    let duplicate;
+    try {
+      // e.g. a Strict Mode re-run, a second tab, or an automatic poll
+      duplicate = await paymentService.capturePayPalOrder(session.id, { transactionId: txn.id, idempotencyKey: key });
+    } finally {
+      releaseCapture();
+    }
+    assert.strictEqual(duplicate.status, "CAPTURE_PENDING");
+    const firstResult = await first;
+    assert.strictEqual(firstResult.status, "COMPLETED");
+
+    // The next automatic poll sees the completed transaction.
+    const poll = await paymentService.capturePayPalOrder(session.id, { transactionId: txn.id, idempotencyKey: key });
+    assert.strictEqual(poll.status, "COMPLETED");
+    assert.strictEqual(poll.providerCaptureId, firstResult.providerCaptureId);
+
+    assert.strictEqual(mockClient.captureCalls, 1);
+    assert.strictEqual(await db.transaction.count({ where: { demoSessionId: session.id } }), 1);
+    assert.strictEqual(await db.paymentAttempt.count({ where: { transactionId: txn.id } }), 1);
+    assert.strictEqual(
+      await db.transactionEvent.count({ where: { transactionId: txn.id, eventType: "TRANSACTION_COMPLETED" } }),
+      1
+    );
+  });
+
+  it("49. a late cancel return never cancels a payment PayPal has captured", async () => {
+    const { session, txn, order } = await createAwaitingOrder("cancel_after_capture");
+    const captured = await paymentService.capturePayPalOrder(session.id, {
+      transactionId: txn.id,
+      idempotencyKey: `capture_${txn.id}`,
+    });
+    assert.strictEqual(captured.status, "COMPLETED");
+
+    mockClient.orderStatus = "CREATED";
+    const result = await paymentService.reconcileAwaitingApproval(session.id, {
+      providerOrderId: order.providerOrderId,
+      reason: "BUYER_RETURNED_TO_CANCEL_URL",
+    });
+    assert.strictEqual(result.outcome, "UNCHANGED");
+    const stored = await db.transaction.findUnique({ where: { id: txn.id } });
+    assert.strictEqual(stored?.status, TransactionStatus.COMPLETED);
+  });
+
+  // ---------------------------------------------------------------------------
+  // PayPal capture errors (HTTP 422 etc.): only confirmed declines become FAILED
+  // ---------------------------------------------------------------------------
+
+  function failCaptureWith(error: Error) {
+    mockClient.captureOrder = async (_orderId: string, requestId?: string) => {
+      mockClient.captureCalls++;
+      mockClient.lastCaptureRequestId = requestId;
+      throw error;
+    };
+  }
+  const declined = () => new PayPalCaptureError(422, "UNPROCESSABLE_ENTITY", "INSTRUMENT_DECLINED");
+
+  it("50. PayPal client keeps only the validated error name and issue code from a capture error", async () => {
+    const originalFetch = globalThis.fetch;
+    const originalClientId = process.env.NEXT_PUBLIC_PAYPAL_CLIENT_ID;
+    const originalSecret = process.env.PAYPAL_CLIENT_SECRET;
+    process.env.NEXT_PUBLIC_PAYPAL_CLIENT_ID ||= "sandbox-client-id";
+    process.env.PAYPAL_CLIENT_SECRET ||= "sandbox-client-secret";
+    const client = new (class extends PayPalClient {
+      override async getAccessToken() { return "token"; }
+    })();
+    const reply = (body: unknown) => {
+      globalThis.fetch = (async () => new Response(JSON.stringify(body), { status: 422 })) as typeof fetch;
+    };
+    const captureError = async () => {
+      try {
+        await client.captureOrder("ORDER_1", "gp_cap_x");
+      } catch (err) {
+        return err;
+      }
+      assert.fail("captureOrder should throw");
+    };
+
+    try {
+      reply({
+        name: "UNPROCESSABLE_ENTITY",
+        message: "The requested action could not be performed.",
+        debug_id: "abc123",
+        details: [{ issue: "INSTRUMENT_DECLINED", description: "secret-ish provider text" }],
+      });
+      const err = await captureError();
+      assert.ok(err instanceof PayPalCaptureError);
+      assert.strictEqual(err.httpStatus, 422);
+      assert.strictEqual(err.errorName, "UNPROCESSABLE_ENTITY");
+      assert.strictEqual(err.issue, "INSTRUMENT_DECLINED");
+      assert.strictEqual(err.message, "PAYPAL_CAPTURE_FAILED_422");
+      assert.ok(!JSON.stringify({ ...err, message: err.message }).includes("secret-ish"));
+
+      // Malformed / unexpected shapes are dropped rather than trusted.
+      reply({ name: "<script>", details: [{ issue: "not an issue code" }] });
+      const malformed = await captureError();
+      assert.ok(malformed instanceof PayPalCaptureError);
+      assert.strictEqual(malformed.errorName, undefined);
+      assert.strictEqual(malformed.issue, undefined);
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (originalClientId === undefined) delete process.env.NEXT_PUBLIC_PAYPAL_CLIENT_ID;
+      else process.env.NEXT_PUBLIC_PAYPAL_CLIENT_ID = originalClientId;
+      if (originalSecret === undefined) delete process.env.PAYPAL_CLIENT_SECRET;
+      else process.env.PAYPAL_CLIENT_SECRET = originalSecret;
+    }
+  });
+
+  it("51. definitive 422 INSTRUMENT_DECLINED with no capture on PayPal is recorded as FAILED", async () => {
+    const { session, txn } = await createAwaitingOrder("instrument_declined");
+    failCaptureWith(declined());
+    const key = `capture_${txn.id}`;
+
+    const result = await paymentService.capturePayPalOrder(session.id, { transactionId: txn.id, idempotencyKey: key });
+    assert.strictEqual(result.status, "FAILED");
+    assert.strictEqual(result.providerCaptureId, undefined);
+    assert.strictEqual(Object.hasOwn(result, "issue"), false);
+    assert.strictEqual(mockClient.getOrderCalls, 2); // pre-capture check + post-error confirmation
+
+    const stored = await db.transaction.findUnique({ where: { id: txn.id }, include: { paymentAttempts: true } });
+    assert.strictEqual(stored?.status, TransactionStatus.FAILED);
+    assert.strictEqual(stored?.failureCode, "PAYPAL_INSTRUMENT_DECLINED");
+    assert.strictEqual(stored?.completedAt, null);
+    assert.strictEqual(stored?.paymentAttempts[0].status, "DENIED");
+    assert.strictEqual(stored?.paymentAttempts[0].reconciliationNeeded, false);
+    assert.strictEqual(stored?.paymentAttempts[0].captureLeaseToken, null);
+    const event = await db.transactionEvent.findFirst({
+      where: { transactionId: txn.id, eventType: "PAYPAL_CAPTURE_DECLINED" },
+    });
+    assert.strictEqual((event?.metadata as { providerIssue?: string })?.providerIssue, "INSTRUMENT_DECLINED");
+
+    // Retrying (e.g. the return page polling) never re-captures a declined payment.
+    await assert.rejects(
+      () => paymentService.capturePayPalOrder(session.id, { transactionId: txn.id, idempotencyKey: key }),
+      (err: unknown) => err instanceof ApiError && err.code === "TRANSACTION_STATE_CONFLICT"
+    );
+    assert.strictEqual(mockClient.captureCalls, 1);
+  });
+
+  it("52. ambiguous HTTP 422 responses stay STATUS_UNKNOWN", async () => {
+    const ambiguous = [
+      new PayPalCaptureError(422, "UNPROCESSABLE_ENTITY", "PAYER_ACTION_REQUIRED"),
+      new PayPalCaptureError(422, "UNPROCESSABLE_ENTITY"), // no issue code
+      new PayPalCaptureError(422, undefined, "INSTRUMENT_DECLINED"), // unexpected envelope
+      new PayPalCaptureError(500, "INTERNAL_SERVER_ERROR", "INSTRUMENT_DECLINED"), // not a 422
+    ];
+    for (const [index, error] of ambiguous.entries()) {
+      const { session, txn } = await createAwaitingOrder(`ambiguous_422_${index}`);
+      failCaptureWith(error);
+      const result = await paymentService.capturePayPalOrder(session.id, {
+        transactionId: txn.id,
+        idempotencyKey: `capture_${txn.id}`,
+      });
+      assert.strictEqual(result.status, "STATUS_UNKNOWN", `case ${index}`);
+      const stored = await db.transaction.findUnique({ where: { id: txn.id }, include: { paymentAttempts: true } });
+      assert.strictEqual(stored?.status, TransactionStatus.STATUS_UNKNOWN, `case ${index}`);
+      assert.strictEqual(stored?.paymentAttempts[0].reconciliationNeeded, true, `case ${index}`);
+    }
+  });
+
+  it("53. a decline is not trusted when PayPal's order record cannot be checked (timeout)", async () => {
+    const { session, txn } = await createAwaitingOrder("decline_inquiry_timeout");
+    mockClient.captureOrder = async () => {
+      mockClient.captureCalls++;
+      mockClient.getOrderError = new Error("PAYPAL_TIMEOUT"); // post-error inquiry times out
+      throw declined();
+    };
+
+    const result = await paymentService.capturePayPalOrder(session.id, {
+      transactionId: txn.id,
+      idempotencyKey: `capture_${txn.id}`,
+    });
+    assert.strictEqual(result.status, "STATUS_UNKNOWN");
+    const stored = await db.transaction.findUnique({ where: { id: txn.id } });
+    assert.strictEqual(stored?.status, TransactionStatus.STATUS_UNKNOWN);
+    const event = await db.transactionEvent.findFirst({
+      where: { transactionId: txn.id, eventType: "CAPTURE_VERIFICATION_UNCERTAIN" },
+    });
+    assert.strictEqual((event?.metadata as { reason?: string })?.reason, "CAPTURE_DECLINE_UNCONFIRMED");
+  });
+
+  it("54. a plain capture timeout is never mapped to FAILED", async () => {
+    const { session, txn } = await createAwaitingOrder("plain_timeout");
+    failCaptureWith(new Error("PAYPAL_TIMEOUT"));
+
+    const result = await paymentService.capturePayPalOrder(session.id, {
+      transactionId: txn.id,
+      idempotencyKey: `capture_${txn.id}`,
+    });
+    assert.strictEqual(result.status, "STATUS_UNKNOWN");
+    const stored = await db.transaction.findUnique({ where: { id: txn.id } });
+    assert.strictEqual(stored?.status, TransactionStatus.STATUS_UNKNOWN);
+  });
+
+  it("55. a decline-looking error is ignored when PayPal already holds a completed capture", async () => {
+    const { session, txn } = await createAwaitingOrder("decline_but_captured");
+    const captureId = `ALREADY_CAPTURED_${txn.id}`;
+    mockClient.captureOrder = async () => {
+      mockClient.captureCalls++;
+      settleOrder(captureId, "COMPLETED");
+      throw declined();
+    };
+
+    const result = await paymentService.capturePayPalOrder(session.id, {
+      transactionId: txn.id,
+      idempotencyKey: `capture_${txn.id}`,
+    });
+    assert.strictEqual(result.status, "COMPLETED");
+    assert.strictEqual(result.providerCaptureId, captureId);
+    const stored = await db.transaction.findUnique({ where: { id: txn.id } });
+    assert.strictEqual(stored?.status, TransactionStatus.COMPLETED);
+  });
+
+  it("56. 422 ORDER_ALREADY_CAPTURED reconciles the existing capture instead of failing", async () => {
+    const { session, txn } = await createAwaitingOrder("order_already_captured");
+    const captureId = `EXISTING_CAPTURE_${txn.id}`;
+    mockClient.captureOrder = async () => {
+      mockClient.captureCalls++;
+      settleOrder(captureId, "COMPLETED");
+      throw new PayPalCaptureError(422, "UNPROCESSABLE_ENTITY", "ORDER_ALREADY_CAPTURED");
+    };
+
+    const result = await paymentService.capturePayPalOrder(session.id, {
+      transactionId: txn.id,
+      idempotencyKey: `capture_${txn.id}`,
+    });
+    assert.strictEqual(result.status, "COMPLETED");
+    assert.strictEqual(result.providerCaptureId, captureId);
+    assert.strictEqual(mockClient.captureCalls, 1);
   });
 });

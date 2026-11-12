@@ -75,20 +75,48 @@ export class PayPalOrderNotFoundError extends Error {
   }
 }
 
-/** Extracts PayPal's first `details[].issue` code from an error body without trusting its shape. */
-async function readPayPalIssue(response: Response): Promise<string | undefined> {
+/**
+ * A non-2xx answer from PayPal's capture endpoint. Carries only the HTTP status
+ * and PayPal's documented error `name` / first `details[].issue` codes (both
+ * validated as plain upper-case identifiers); never the raw body.
+ */
+export class PayPalCaptureError extends Error {
+  constructor(
+    readonly httpStatus: number,
+    readonly errorName?: string,
+    readonly issue?: string
+  ) {
+    super(`PAYPAL_CAPTURE_FAILED_${httpStatus}`);
+    this.name = "PayPalCaptureError";
+  }
+}
+
+const PAYPAL_CODE_PATTERN = /^[A-Z0-9_]{1,80}$/;
+
+function safeCode(value: unknown): string | undefined {
+  return typeof value === "string" && PAYPAL_CODE_PATTERN.test(value) ? value : undefined;
+}
+
+/** Extracts PayPal's error `name` and first `details[].issue` without trusting the body's shape. */
+async function readPayPalError(response: Response): Promise<{ name?: string; issue?: string }> {
   try {
     const body: unknown = await response.json();
-    if (typeof body !== "object" || body === null) return undefined;
-    const details = (body as Record<string, unknown>).details;
-    if (!Array.isArray(details)) return undefined;
-    const first: unknown = details[0];
-    if (typeof first !== "object" || first === null) return undefined;
-    const issue = (first as Record<string, unknown>).issue;
-    return typeof issue === "string" && /^[A-Z0-9_]{1,80}$/.test(issue) ? issue : undefined;
+    if (typeof body !== "object" || body === null) return {};
+    const record = body as Record<string, unknown>;
+    const details = record.details;
+    const first: unknown = Array.isArray(details) ? details[0] : undefined;
+    const issue = typeof first === "object" && first !== null
+      ? safeCode((first as Record<string, unknown>).issue)
+      : undefined;
+    return { name: safeCode(record.name), issue };
   } catch {
-    return undefined;
+    return {};
   }
+}
+
+/** Extracts PayPal's first `details[].issue` code from an error body without trusting its shape. */
+async function readPayPalIssue(response: Response): Promise<string | undefined> {
+  return (await readPayPalError(response)).issue;
 }
 
 export function validatePayPalApprovalUrl(value: unknown): string {
@@ -384,10 +412,11 @@ export class PayPalClient {
     }
 
     if (!response.ok) {
+      const { name, issue } = await readPayPalError(response);
       logger.error("PayPal capture failed", {
-        context: { orderId, status: response.status },
+        context: { orderId, status: response.status, name, issue },
       });
-      throw new Error(`PAYPAL_CAPTURE_FAILED_${response.status}`);
+      throw new PayPalCaptureError(response.status, name, issue);
     }
 
     const data = await response.json();

@@ -124,9 +124,6 @@ export async function generateGeminiChatResponse(
             generationConfig: {
               temperature: 0.4,
               maxOutputTokens: 700,
-              thinkingConfig: {
-                thinkingLevel: "LOW",
-              },
             },
           }),
           signal: controller.signal,

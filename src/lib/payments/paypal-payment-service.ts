@@ -22,6 +22,7 @@ import { db } from "../db";
 import { ApiError } from "../errors/api-error";
 import { logger } from "../logging/logger";
 import {
+  PayPalCaptureError,
   PayPalOrderCreationError,
   PayPalOrderNotFoundError,
   payPalClient,
@@ -41,7 +42,8 @@ export interface CreatePaymentResult {
 
 export interface CapturePaymentResult {
   transactionId: string;
-  status: "COMPLETED" | "CAPTURE_PENDING" | "STATUS_UNKNOWN";
+  /** FAILED only when PayPal itself reports the capture DECLINED or FAILED. */
+  status: "COMPLETED" | "CAPTURE_PENDING" | "STATUS_UNKNOWN" | "FAILED";
   amount: string;
   currency: string;
   capturedAt?: string;
@@ -75,6 +77,91 @@ function amountMatches(actual: string, expected: Prisma.Decimal): boolean {
   }
 }
 
+/** Capture states PayPal documents as final, money-not-moved outcomes. */
+const DEFINITIVE_FAILED_CAPTURE_STATES = new Set(["DECLINED", "FAILED"]);
+
+/**
+ * PayPal capture issues (HTTP 422, name UNPROCESSABLE_ENTITY) documented as the
+ * payment being refused without creating a capture. Every other error,
+ * including other 422 issues such as ORDER_ALREADY_CAPTURED, is ambiguous.
+ */
+const DEFINITIVE_CAPTURE_DECLINE_ISSUES = new Set(["INSTRUMENT_DECLINED", "TRANSACTION_REFUSED"]);
+
+/** Returns the PayPal issue code when a capture error is a definitive decline. */
+export function definitiveCaptureDecline(err: unknown): string | undefined {
+  if (!(err instanceof PayPalCaptureError)) return undefined;
+  if (err.httpStatus !== 422 || err.errorName !== "UNPROCESSABLE_ENTITY") return undefined;
+  return err.issue && DEFINITIVE_CAPTURE_DECLINE_ISSUES.has(err.issue) ? err.issue : undefined;
+}
+
+type OrderCaptureEvidence =
+  | { kind: "completed"; captureId: string }
+  | { kind: "failed"; captureId: string; captureStatus: string }
+  /** The order matches and PayPal holds no capture for it. */
+  | { kind: "no_capture" }
+  | { kind: "uncertain" };
+
+/**
+ * Classifies PayPal's authoritative order record for a capture outcome.
+ * Requires the order identity, amount, currency and payee to match, and exactly
+ * one capture whose amount and currency match. Anything else is uncertain.
+ */
+function evaluateOrderCapture(
+  order: { id: string; status: string; amount: string; currency: string; payeeEmail?: string; captures?: Array<{ id: string; status: string; amount: string; currency: string }> },
+  expected: { providerOrderId: string; amount: Prisma.Decimal; currency: string; payeeEmail: string }
+): OrderCaptureEvidence {
+  const payeeVerified =
+    typeof order.payeeEmail === "string" &&
+    order.payeeEmail.trim().toLowerCase() === expected.payeeEmail.trim().toLowerCase();
+  if (
+    order.id !== expected.providerOrderId ||
+    order.currency !== expected.currency ||
+    !amountMatches(order.amount, expected.amount) ||
+    !payeeVerified
+  ) {
+    return { kind: "uncertain" };
+  }
+
+  const captures = order.captures || [];
+  if (captures.length === 0 && order.status !== "COMPLETED") return { kind: "no_capture" };
+  if (captures.length !== 1) return { kind: "uncertain" };
+  const capture = captures[0];
+  if (!capture.id || capture.currency !== expected.currency || !amountMatches(capture.amount, expected.amount)) {
+    return { kind: "uncertain" };
+  }
+
+  if (order.status === "COMPLETED" && capture.status === "COMPLETED") {
+    return { kind: "completed", captureId: capture.id };
+  }
+  if (DEFINITIVE_FAILED_CAPTURE_STATES.has(capture.status)) {
+    return { kind: "failed", captureId: capture.id, captureStatus: capture.status };
+  }
+  return { kind: "uncertain" };
+}
+
+interface UncertainCaptureParams {
+  transaction: {
+    id: string;
+    amount: Prisma.Decimal;
+    currency: string;
+    status: TransactionStatus;
+  };
+  attempt: {
+    id: string;
+    status: PaymentAttemptStatus;
+    providerCaptureId: string | null;
+  };
+  leaseToken: string;
+  idempotencyOperationId: string;
+  requestId?: string;
+  reason: string;
+  providerStatus?: string;
+  providerAmount?: string;
+  providerCurrency?: string;
+  providerCaptureId?: string;
+  payeeVerified: boolean;
+}
+
 export class PayPalPaymentService {
   constructor(private client: PayPalClient = payPalClient) {}
 
@@ -86,28 +173,7 @@ export class PayPalPaymentService {
     return createHash("sha256").update(JSON.stringify(payload)).digest("hex");
   }
 
-  private async persistUncertainCapture(params: {
-    transaction: {
-      id: string;
-      amount: Prisma.Decimal;
-      currency: string;
-      status: TransactionStatus;
-    };
-    attempt: {
-      id: string;
-      status: PaymentAttemptStatus;
-      providerCaptureId: string | null;
-    };
-    leaseToken: string;
-    idempotencyOperationId: string;
-    requestId?: string;
-    reason: string;
-    providerStatus?: string;
-    providerAmount?: string;
-    providerCurrency?: string;
-    providerCaptureId?: string;
-    payeeVerified: boolean;
-  }): Promise<CapturePaymentResult> {
+  private async persistUncertainCapture(params: UncertainCaptureParams): Promise<CapturePaymentResult> {
     const now = new Date();
     const providerCaptureId = params.providerCaptureId || params.attempt.providerCaptureId || undefined;
     const result: CapturePaymentResult = {
@@ -206,6 +272,8 @@ export class PayPalPaymentService {
     requestId?: string;
     captureId: string;
     recovered: boolean;
+    /** Set when completion was proven by an order inquiry rather than the capture response. */
+    verifiedVia?: "ORDER_INQUIRY";
   }): Promise<CapturePaymentResult> {
     const now = new Date();
     const result: CapturePaymentResult = {
@@ -217,7 +285,11 @@ export class PayPalPaymentService {
       providerCaptureId: params.captureId,
     };
     const eventType = params.recovered ? "PAYPAL_CAPTURE_RECOVERED" : "PAYPAL_CAPTURE_COMPLETED";
-    const metadata = { captureId: params.captureId, recovered: params.recovered };
+    const metadata = {
+      captureId: params.captureId,
+      recovered: params.recovered,
+      ...(params.verifiedVia ? { verifiedVia: params.verifiedVia } : {}),
+    };
 
     await db.$transaction([
       db.paymentAttempt.update({
@@ -272,6 +344,167 @@ export class PayPalPaymentService {
     ]);
 
     return result;
+  }
+
+  /**
+   * Records a capture PayPal itself reports as DECLINED or FAILED. Only called
+   * with evidence from PayPal's order record, never on timeouts or ambiguity.
+   */
+  private async persistFailedCapture(params: {
+    transaction: { id: string; amount: Prisma.Decimal; currency: string; status: TransactionStatus };
+    attempt: { id: string; status: PaymentAttemptStatus };
+    leaseToken: string;
+    idempotencyOperationId: string;
+    requestId?: string;
+    captureId?: string;
+    captureStatus: string;
+    /** PayPal issue code when the decline came from a capture error, e.g. INSTRUMENT_DECLINED. */
+    providerIssue?: string;
+  }): Promise<CapturePaymentResult> {
+    const now = new Date();
+    const failureCode = params.providerIssue ? `PAYPAL_${params.providerIssue}` : `CAPTURE_${params.captureStatus}`;
+    const attemptStatus = params.captureStatus === "DECLINED"
+      ? PaymentAttemptStatus.DENIED
+      : PaymentAttemptStatus.FAILED;
+    const result: CapturePaymentResult = {
+      transactionId: params.transaction.id,
+      status: "FAILED",
+      amount: params.transaction.amount.toString(),
+      currency: params.transaction.currency,
+      providerCaptureId: params.captureId,
+    };
+    const metadata = {
+      captureId: params.captureId ?? null,
+      providerStatus: params.captureStatus,
+      ...(params.providerIssue ? { providerIssue: params.providerIssue } : {}),
+    };
+
+    await db.$transaction([
+      db.paymentAttempt.update({
+        where: { id: params.attempt.id, captureLeaseToken: params.leaseToken },
+        data: {
+          providerCaptureId: params.captureId,
+          providerStatus: params.captureStatus,
+          status: attemptStatus,
+          reconciliationNeeded: false,
+          failureCode,
+          lastCheckedAt: now,
+          captureLeaseToken: null,
+          captureLeaseUntil: null,
+          events: {
+            create: {
+              transactionId: params.transaction.id,
+              eventType: "PAYPAL_CAPTURE_DECLINED",
+              fromStatus: params.attempt.status,
+              toStatus: attemptStatus,
+              source: "PAYPAL_API",
+              requestId: params.requestId || null,
+              metadata,
+            },
+          },
+        },
+      }),
+      db.transaction.update({
+        where: { id: params.transaction.id },
+        data: {
+          status: TransactionStatus.FAILED,
+          failureCode,
+          events: {
+            create: {
+              eventType: "TRANSACTION_FAILED",
+              fromStatus: params.transaction.status,
+              toStatus: TransactionStatus.FAILED,
+              source: "PAYPAL_API",
+              requestId: params.requestId || null,
+              metadata,
+            },
+          },
+        },
+      }),
+      db.idempotencyOperation.update({
+        where: { id: params.idempotencyOperationId },
+        data: {
+          status: IdempotencyStatus.FAILED,
+          safeResult: result as unknown as Prisma.InputJsonValue,
+        },
+      }),
+    ]);
+
+    return result;
+  }
+
+  /**
+   * After a capture call whose response could not be fully verified (timeout,
+   * missing payee or capture ID, non-final status), asks PayPal for the order
+   * record while still holding the lease. PayPal's capture response omits the
+   * payee, so this is the normal way a real Sandbox capture gets proven.
+   * Never captures again; falls back to the uncertain state on any doubt.
+   */
+  private async verifyCaptureViaOrderInquiry(
+    params: UncertainCaptureParams & {
+      providerOrderId: string;
+      payeeEmail: string;
+      /** Capture ID PayPal returned, if any; the order's capture must match it. */
+      expectedCaptureId?: string;
+      /** Definitive PayPal decline issue from the capture call, if any. */
+      declineIssue?: string;
+    }
+  ): Promise<CapturePaymentResult> {
+    const { providerOrderId, payeeEmail, expectedCaptureId, declineIssue, ...uncertain } = params;
+
+    let order;
+    try {
+      order = await this.client.getOrder(providerOrderId);
+    } catch {
+      return this.persistUncertainCapture(uncertain);
+    }
+
+    const evidence = evaluateOrderCapture(order, {
+      providerOrderId,
+      amount: params.transaction.amount,
+      currency: params.transaction.currency,
+      payeeEmail,
+    });
+    const captureIdConsistent =
+      evidence.kind === "uncertain" || evidence.kind === "no_capture" || !expectedCaptureId || evidence.captureId === expectedCaptureId;
+
+    if (evidence.kind === "completed" && captureIdConsistent) {
+      return this.persistCompletedCapture({
+        transaction: params.transaction,
+        attempt: params.attempt,
+        leaseToken: params.leaseToken,
+        idempotencyOperationId: params.idempotencyOperationId,
+        requestId: params.requestId,
+        captureId: evidence.captureId,
+        recovered: false,
+        verifiedVia: "ORDER_INQUIRY",
+      });
+    }
+    if (evidence.kind === "failed" && captureIdConsistent) {
+      return this.persistFailedCapture({
+        transaction: params.transaction,
+        attempt: params.attempt,
+        leaseToken: params.leaseToken,
+        idempotencyOperationId: params.idempotencyOperationId,
+        requestId: params.requestId,
+        captureId: evidence.captureId,
+        captureStatus: evidence.captureStatus,
+      });
+    }
+    // A decline is recorded only once PayPal's own order record confirms no
+    // capture exists, so a payment PayPal may have captured is never FAILED.
+    if (declineIssue && evidence.kind === "no_capture") {
+      return this.persistFailedCapture({
+        transaction: params.transaction,
+        attempt: params.attempt,
+        leaseToken: params.leaseToken,
+        idempotencyOperationId: params.idempotencyOperationId,
+        requestId: params.requestId,
+        captureStatus: "DECLINED",
+        providerIssue: declineIssue,
+      });
+    }
+    return this.persistUncertainCapture(uncertain);
   }
 
   /**
@@ -878,6 +1111,27 @@ export class PayPalPaymentService {
         recoveredCapture.currency === transaction.currency &&
         amountMatches(recoveredCapture.amount, transaction.amount);
 
+      // PayPal finalized the order but declined/failed the capture: no money moved.
+      const evidence = evaluateOrderCapture(orderDetails, {
+        providerOrderId: activeAttempt.providerOrderId,
+        amount: transaction.amount,
+        currency: transaction.currency,
+        payeeEmail: config.payeeEmail,
+      });
+      if (evidence.kind === "failed") {
+        return this.persistFailedCapture({
+          transaction,
+          attempt: { ...activeAttempt, status: activeAttempt.status === PaymentAttemptStatus.AWAITING_APPROVAL
+            ? PaymentAttemptStatus.CAPTURE_PENDING
+            : activeAttempt.status },
+          leaseToken,
+          idempotencyOperationId: idempotencyOp.id,
+          requestId,
+          captureId: evidence.captureId,
+          captureStatus: evidence.captureStatus,
+        });
+      }
+
       if (!captureIsVerified || !recoveredCapture?.id) {
         return this.persistUncertainCapture({
           transaction,
@@ -1067,21 +1321,32 @@ export class PayPalPaymentService {
     let captureResponse;
     try {
       captureResponse = await this.client.captureOrder(activeAttempt.providerOrderId, providerCaptureRequestId);
-    } catch {
-      return this.persistUncertainCapture({
+    } catch (captureError) {
+      // Timeout or provider error: the capture may or may not have happened.
+      // Ask PayPal's order record before settling on an uncertain state.
+      const declineIssue = definitiveCaptureDecline(captureError);
+      return this.verifyCaptureViaOrderInquiry({
         transaction,
         attempt: { ...activeAttempt, status: PaymentAttemptStatus.CAPTURE_PENDING },
         leaseToken,
         idempotencyOperationId: idempotencyOp.id,
         requestId,
-        reason: "CAPTURE_RESPONSE_UNCERTAIN",
+        reason: declineIssue ? "CAPTURE_DECLINE_UNCONFIRMED" : "CAPTURE_RESPONSE_UNCERTAIN",
+        // Only the validated PayPal issue code is stored, never the raw body.
+        providerStatus: captureError instanceof PayPalCaptureError ? captureError.issue : undefined,
+        declineIssue,
         payeeVerified,
+        providerOrderId: activeAttempt.providerOrderId,
+        payeeEmail: config.payeeEmail,
       });
     }
 
     const capturePayeeVerified =
       typeof captureResponse.payeeEmail === "string" &&
       captureResponse.payeeEmail.trim().toLowerCase() === config.payeeEmail.trim().toLowerCase();
+    // A payee that is present but different is a hard conflict, never "recoverable".
+    const capturePayeeConflict =
+      typeof captureResponse.payeeEmail === "string" && !capturePayeeVerified;
     const captureIsVerified =
       captureResponse.status === "COMPLETED" &&
       !!captureResponse.captureId &&
@@ -1090,7 +1355,16 @@ export class PayPalPaymentService {
       capturePayeeVerified;
 
     if (!captureIsVerified || !captureResponse.captureId) {
-      return this.persistUncertainCapture({
+      const providerOrderId = activeAttempt.providerOrderId;
+      const verify = capturePayeeConflict
+        ? (p: UncertainCaptureParams) => this.persistUncertainCapture(p)
+        : (p: UncertainCaptureParams) => this.verifyCaptureViaOrderInquiry({
+          ...p,
+          providerOrderId,
+          payeeEmail: config.payeeEmail,
+          expectedCaptureId: captureResponse.captureId,
+        });
+      return verify({
         transaction,
         attempt: { ...activeAttempt, status: PaymentAttemptStatus.CAPTURE_PENDING },
         leaseToken,

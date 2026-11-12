@@ -13,114 +13,45 @@ import {
   POST_PAYMENT_REDIRECT_PATH,
   shouldRedirectAfterPayment,
 } from "@/lib/payments/post-payment-redirect";
+import { reconcilePaymentReturn, type ReturnOutcome } from "@/lib/payments/payment-return-reconciler";
 
-interface CapturedState {
-  transactionId: string;
-  status: string;
-  amount: string;
-  currency: string;
-  capturedAt?: string;
-  providerCaptureId?: string;
-}
-
-// One server-side resolve + capture per PayPal token, shared across React
-// Strict Mode effect re-runs. Without this, development mode sends two capture
-// requests: the second finds the first one's lease and reports "under review"
-// even when the first capture succeeded. Failed requests are evicted so the
-// user can retry; the server's idempotency key makes retries safe.
-const captureRequests = new Map<string, Promise<CapturedState>>();
-
-async function errorMessage(response: Response, fallback: string): Promise<string> {
-  const data: unknown = await response.json().catch(() => null);
-  if (typeof data === "object" && data !== null) {
-    const error = (data as Record<string, unknown>).error;
-    if (typeof error === "object" && error !== null) {
-      const message = (error as Record<string, unknown>).message;
-      if (typeof message === "string" && message) return message;
-    }
-  }
-  return fallback;
-}
-
-function resolveAndCapture(token: string): Promise<CapturedState> {
-  const existing = captureRequests.get(token);
-  if (existing) return existing;
-
-  const request = (async () => {
-    // 1. Authoritatively resolve the session-owned transaction matching this PayPal order token
-    const resolveRes = await fetch(`/api/payments/paypal/resolve?token=${encodeURIComponent(token)}`, {
-      cache: "no-store",
-    });
-    if (!resolveRes.ok) {
-      throw new Error(await errorMessage(resolveRes, "Could not resolve matching transaction for this order."));
-    }
-    const resolved = await resolveRes.json();
-    const transactionId = resolved.transactionId;
-
-    // 2. Perform authoritative server-side capture or recovery
-    const idempotencyKey = `capture_${transactionId}_${token}`;
-    const captureRes = await fetch("/api/payments/paypal/capture", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ transactionId, idempotencyKey }),
-    });
-    if (!captureRes.ok) {
-      throw new Error(await errorMessage(captureRes, "Failed to capture payment."));
-    }
-    return (await captureRes.json()) as CapturedState;
-  })();
-
-  captureRequests.set(token, request);
-  request.catch(() => captureRequests.delete(token));
-  return request;
-}
+type ReturnView =
+  | { kind: "loading"; reconciling: boolean }
+  | ReturnOutcome;
 
 export function PaymentReturnClient() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const token = searchParams.get("token"); // PayPal order ID
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [captured, setCaptured] = useState<CapturedState | null>(null);
-  const [recheckCount, setRecheckCount] = useState(0);
+  const [view, setView] = useState<ReturnView>({ kind: "loading", reconciling: false });
+  const [runCount, setRunCount] = useState(0);
 
+  // Capture once, then keep reconciling automatically until PayPal gives a
+  // definitive answer or the polling window ends. Aborting on cleanup stops the
+  // loop on unmount; Strict Mode's second effect run shares the in-flight
+  // request, and the server's idempotency key + capture lease make any
+  // duplicate request safe.
   useEffect(() => {
-    let isMounted = true;
+    if (!token) return;
+    const controller = new AbortController();
 
-    async function processReturn() {
-      if (!token) {
-        if (isMounted) {
-          setError("No payment token was provided in the return URL.");
-          setLoading(false);
-        }
-        return;
-      }
+    reconcilePaymentReturn(token, {
+      signal: controller.signal,
+      onProgress: () => {
+        if (!controller.signal.aborted) setView({ kind: "loading", reconciling: true });
+      },
+    }).then((outcome) => {
+      if (outcome && !controller.signal.aborted) setView(outcome);
+    });
 
-      try {
-        const captureData = await resolveAndCapture(token);
-        if (isMounted) {
-          setCaptured(captureData);
-          setLoading(false);
-        }
-      } catch (err: unknown) {
-        if (isMounted) {
-          setError(err instanceof Error ? err.message : "Payment capture failed.");
-          setLoading(false);
-        }
-      }
-    }
-
-    processReturn();
-
-    return () => {
-      isMounted = false;
-    };
-  }, [token, recheckCount]);
+    return () => controller.abort();
+  }, [token, runCount]);
 
   // Redirect to the dashboard only after the backend confirms COMPLETED.
   // The timer is cleared on unmount or state change, and the ref guarantees a
   // single navigation even if the effect re-runs (e.g. React Strict Mode).
   const hasRedirectedRef = useRef(false);
+  const captured = view.kind === "completed" ? view.payment : null;
   const isConfirmedComplete = shouldRedirectAfterPayment(captured);
 
   useEffect(() => {
@@ -140,15 +71,19 @@ export function PaymentReturnClient() {
   }
 
   function recheckStatus() {
-    // Re-ask the server; the same idempotency key returns the stored result or reconciles.
-    if (token) captureRequests.delete(token);
-    setError(null);
-    setCaptured(null);
-    setLoading(true);
-    setRecheckCount((count) => count + 1);
+    // Manual fallback: restart the automatic reconciliation window. The same
+    // idempotency key returns the stored result or reconciles with PayPal.
+    setView({ kind: "loading", reconciling: true });
+    setRunCount((count) => count + 1);
   }
 
-  if (loading) {
+  const error = !token
+    ? "No payment token was provided in the return URL."
+    : view.kind === "error"
+      ? view.message
+      : null;
+
+  if (!error && view.kind === "loading") {
     return (
       <div className="mx-auto flex w-full max-w-xl flex-col items-center gap-6 py-16 text-center">
         <span className="grid size-14 place-items-center rounded-full bg-lavender/20 text-lavender animate-pulse">
@@ -158,14 +93,44 @@ export function PaymentReturnClient() {
         <h1 className="text-2xl font-semibold text-ink sm:text-3xl">
           Confirming Payment Status...
         </h1>
-        <p className="text-sm text-ink-muted">
-          We are executing server-side capture against PayPal Sandbox. Please do not close this window.
+        <p role="status" aria-live="polite" className="text-sm text-ink-muted">
+          {view.reconciling
+            ? "PayPal is still finalising this payment. We are checking again automatically. Please do not close this window."
+            : "We are executing server-side capture against PayPal Sandbox. Please do not close this window."}
         </p>
       </div>
     );
   }
 
-  if (error || !captured) {
+  if (view.kind === "failed") {
+    const cancelled = view.status === "CANCELLED";
+    return (
+      <div className="mx-auto flex w-full max-w-xl flex-col items-center gap-6 py-16 text-center">
+        <span className="grid size-14 place-items-center rounded-full bg-danger/20 text-danger">
+          <AlertTriangle aria-hidden className="size-8" />
+        </span>
+        <Badge tone={cancelled ? "neutral" : "danger"}>{view.status}</Badge>
+        <h1 className="text-2xl font-semibold text-ink sm:text-3xl">
+          {cancelled ? "Payment Cancelled" : "Payment Failed"}
+        </h1>
+        <p className="text-sm text-ink-muted">
+          {cancelled
+            ? "PayPal approval was not completed, so no payment was taken."
+            : "PayPal did not complete this payment, so no money was taken. You can start a new payment."}
+        </p>
+        <div className="mt-4 flex gap-3">
+          <Link
+            href="/dashboard"
+            className="inline-flex min-h-11 items-center justify-center rounded-control bg-primary px-5 text-sm font-medium text-white hover:bg-primary-hover"
+          >
+            Return to Dashboard
+          </Link>
+        </div>
+      </div>
+    );
+  }
+
+  if (error || view.kind === "loading") {
     return (
       <div className="mx-auto flex w-full max-w-xl flex-col items-center gap-6 py-16 text-center">
         <span className="grid size-14 place-items-center rounded-full bg-danger/20 text-danger">
@@ -188,7 +153,7 @@ export function PaymentReturnClient() {
     );
   }
 
-  if (captured.status !== "COMPLETED") {
+  if (view.kind === "under_review" || !captured) {
     return (
       <div className="mx-auto flex w-full max-w-xl flex-col items-center gap-6 py-16 text-center">
         <span className="grid size-14 place-items-center rounded-full bg-warning/20 text-warning">
@@ -199,7 +164,7 @@ export function PaymentReturnClient() {
           Payment Under Review
         </h1>
         <p className="text-sm text-ink-muted">
-          We could not verify the PayPal result yet. Do not start another payment while this transaction is being reconciled.
+          We could not verify the PayPal result yet. We checked with PayPal automatically for about a minute without a final answer; this can happen when PayPal is still processing. Do not start another payment while this transaction is being reconciled.
         </p>
         <div className="mt-4 flex gap-3">
           <button

@@ -42,7 +42,8 @@ export async function POST(request: Request) {
     return NextResponse.json(
       result,
       {
-        status: result.status === "COMPLETED" ? 200 : 202,
+        // 200 for definitive outcomes; 202 tells the client to keep reconciling.
+        status: result.status === "COMPLETED" || result.status === "FAILED" ? 200 : 202,
         headers: {
           "x-request-id": requestId,
           "cache-control": "no-store",
