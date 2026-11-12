@@ -40,3 +40,19 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# logs
+*.log
+
+# editor / OS files
+.vscode/
+.idea/
+Thumbs.db
+
+# database dumps (keep Prisma migrations tracked)
+*.sql
+*.dump
+!/prisma/migrations/**/*.sql
+
+# local AI-assistant tooling configuration
+.claude/
