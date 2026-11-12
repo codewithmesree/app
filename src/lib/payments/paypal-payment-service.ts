@@ -23,10 +23,12 @@ import { ApiError } from "../errors/api-error";
 import { logger } from "../logging/logger";
 import {
   PayPalOrderCreationError,
+  PayPalOrderNotFoundError,
   payPalClient,
   type PayPalClient,
   validatePayPalApprovalUrl,
 } from "../paypal/paypal-client";
+import { isPayPalSupportedCurrency, unsupportedCurrencyMessage } from "../paypal/paypal-currencies";
 import { getPayPalConfig, PayPalConfigurationError } from "../paypal/paypal-config";
 import { evaluatePaymentEligibility } from "./eligibility";
 
@@ -46,7 +48,24 @@ export interface CapturePaymentResult {
   providerCaptureId?: string;
 }
 
+export interface ReconcileApprovalResult {
+  transactionId: string;
+  merchantId: string;
+  status: TransactionStatus;
+  /** What this reconciliation did. UNCHANGED means the server state was left as-is. */
+  outcome: "CANCELLED" | "EXPIRED" | "FAILED" | "UNCHANGED";
+}
+
+export type ReconcileApprovalReason = "BUYER_RETURNED_TO_CANCEL_URL" | "STALE_APPROVAL_SWEEP";
+
 const CAPTURE_LEASE_MS = 30_000;
+/** Unapproved PayPal orders are only treated as expired once they are at least this old. */
+export const STALE_APPROVAL_AGE_MS = 3 * 60 * 60 * 1000;
+/** Minimum gap between provider inquiries for the same stale attempt. */
+const STALE_APPROVAL_RECHECK_MS = 10 * 60 * 1000;
+const STALE_APPROVAL_SWEEP_LIMIT = 5;
+/** PayPal order states that mean the buyer has not approved the order. */
+const UNAPPROVED_ORDER_STATES = new Set(["CREATED", "SAVED", "PAYER_ACTION_REQUIRED"]);
 
 function amountMatches(actual: string, expected: Prisma.Decimal): boolean {
   try {
@@ -318,6 +337,28 @@ export class PayPalPaymentService {
       });
     }
 
+    // CANCELLED and FAILED are terminal (payment-flow.md state diagram). A retry
+    // must start a new transaction so history is never rewritten.
+    if (
+      transaction.status === TransactionStatus.CANCELLED ||
+      transaction.status === TransactionStatus.FAILED
+    ) {
+      throw new ApiError({
+        statusCode: 409,
+        code: "TRANSACTION_STATE_CONFLICT",
+        message: "This payment attempt has ended. Start a new payment to try again.",
+      });
+    }
+
+    // PF-17: reject currencies PayPal cannot accept before any provider call.
+    if (!isPayPalSupportedCurrency(transaction.currency)) {
+      throw new ApiError({
+        statusCode: 422,
+        code: "UNSUPPORTED_CURRENCY",
+        message: unsupportedCurrencyMessage(transaction.currency),
+      });
+    }
+
     const uncertainCreateAttempt = transaction.paymentAttempts.find(
       (attempt) =>
         attempt.status === PaymentAttemptStatus.STATUS_UNKNOWN &&
@@ -503,7 +544,22 @@ export class PayPalPaymentService {
           data: { status: IdempotencyStatus.FAILED },
         }),
       ]);
-      throw error;
+
+      const issue = error instanceof PayPalOrderCreationError ? error.issue : undefined;
+      if (issue === "CURRENCY_NOT_SUPPORTED") {
+        throw new ApiError({
+          statusCode: 422,
+          code: "UNSUPPORTED_CURRENCY",
+          message: unsupportedCurrencyMessage(transaction.currency),
+          cause: error,
+        });
+      }
+      throw new ApiError({
+        statusCode: 502,
+        code: "PAYPAL_PROVIDER_ERROR",
+        message: "PayPal Sandbox rejected the order request. No payment was created. Please try again later.",
+        cause: error,
+      });
     }
 
     // 6. Update PaymentAttempt, Transaction, and Idempotency atomically
@@ -1091,6 +1147,261 @@ export class PayPalPaymentService {
         payeeVerified: capturePayeeVerified,
       });
     }
+  }
+
+  /**
+   * Verifies an AWAITING_APPROVAL attempt with PayPal and records only a
+   * definitive outcome (payment-flow.md Step 3: "verify the order's actual
+   * provider status before marking the transaction CANCELLED").
+   *
+   * - Buyer returned via the cancel URL and PayPal shows the order unapproved -> CANCELLED.
+   * - PayPal reports EXPIRED, or the order is gone (404) after STALE_APPROVAL_AGE_MS -> CANCELLED (expired).
+   * - PayPal reports VOIDED -> FAILED.
+   * - APPROVED / COMPLETED / unreachable provider -> left unchanged so capture can still proceed.
+   *
+   * Uses the same per-attempt lease as capture, so it can never race a capture.
+   */
+  async reconcileAwaitingApproval(
+    sessionId: string,
+    params: { providerOrderId: string; reason: ReconcileApprovalReason },
+    requestId?: string
+  ): Promise<ReconcileApprovalResult> {
+    const attempt = await db.paymentAttempt.findFirst({
+      where: {
+        provider: PaymentProvider.PAYPAL,
+        providerOrderId: params.providerOrderId,
+        transaction: { demoSessionId: sessionId },
+      },
+      include: { transaction: { select: { id: true, status: true, merchantId: true } } },
+    });
+
+    if (!attempt) {
+      throw ApiError.notFound("Payment order not found for this session.");
+    }
+
+    const unchanged = (status: TransactionStatus = attempt.transaction.status): ReconcileApprovalResult => ({
+      transactionId: attempt.transaction.id,
+      merchantId: attempt.transaction.merchantId,
+      status,
+      outcome: "UNCHANGED",
+    });
+
+    if (
+      attempt.status !== PaymentAttemptStatus.AWAITING_APPROVAL ||
+      attempt.transaction.status !== TransactionStatus.AWAITING_APPROVAL
+    ) {
+      return unchanged();
+    }
+
+    const now = new Date();
+    const leaseToken = randomUUID();
+    const claim = await db.paymentAttempt.updateMany({
+      where: {
+        id: attempt.id,
+        status: PaymentAttemptStatus.AWAITING_APPROVAL,
+        OR: [{ captureLeaseUntil: null }, { captureLeaseUntil: { lte: now } }],
+      },
+      data: {
+        captureLeaseToken: leaseToken,
+        captureLeaseUntil: new Date(now.getTime() + CAPTURE_LEASE_MS),
+        lastCheckedAt: now,
+      },
+    });
+    if (claim.count !== 1) {
+      // A capture or another reconciliation currently holds this attempt.
+      return unchanged();
+    }
+
+    const releaseLease = async (providerStatus?: string) => {
+      await db.paymentAttempt.updateMany({
+        where: { id: attempt.id, captureLeaseToken: leaseToken },
+        data: {
+          captureLeaseToken: null,
+          captureLeaseUntil: null,
+          ...(providerStatus ? { providerStatus } : {}),
+        },
+      });
+    };
+
+    let providerStatus: string;
+    try {
+      const order = await this.client.getOrder(params.providerOrderId);
+      if (order.id !== params.providerOrderId) {
+        await releaseLease();
+        return unchanged();
+      }
+      providerStatus = order.status;
+    } catch (error) {
+      if (error instanceof PayPalOrderNotFoundError) {
+        providerStatus = "NOT_FOUND";
+      } else {
+        logger.warn("PayPal order inquiry failed during approval reconciliation", {
+          requestId,
+          context: { transactionId: attempt.transaction.id, paymentAttemptId: attempt.id, reason: params.reason },
+        });
+        await releaseLease();
+        return unchanged();
+      }
+    }
+
+    const ageMs = now.getTime() - attempt.createdAt.getTime();
+    let decision: {
+      attemptStatus: PaymentAttemptStatus;
+      transactionStatus: TransactionStatus;
+      failureCode: string;
+      outcome: ReconcileApprovalResult["outcome"];
+    } | null = null;
+
+    if (providerStatus === "EXPIRED" || (providerStatus === "NOT_FOUND" && ageMs >= STALE_APPROVAL_AGE_MS)) {
+      decision = {
+        attemptStatus: PaymentAttemptStatus.CANCELLED,
+        transactionStatus: TransactionStatus.CANCELLED,
+        failureCode: "PAYPAL_ORDER_EXPIRED",
+        outcome: "EXPIRED",
+      };
+    } else if (providerStatus === "VOIDED") {
+      decision = {
+        attemptStatus: PaymentAttemptStatus.FAILED,
+        transactionStatus: TransactionStatus.FAILED,
+        failureCode: "ORDER_VOIDED",
+        outcome: "FAILED",
+      };
+    } else if (
+      params.reason === "BUYER_RETURNED_TO_CANCEL_URL" &&
+      UNAPPROVED_ORDER_STATES.has(providerStatus)
+    ) {
+      decision = {
+        attemptStatus: PaymentAttemptStatus.CANCELLED,
+        transactionStatus: TransactionStatus.CANCELLED,
+        failureCode: "BUYER_CANCELLED",
+        outcome: "CANCELLED",
+      };
+    }
+
+    if (!decision) {
+      await releaseLease(providerStatus === "NOT_FOUND" ? undefined : providerStatus);
+      return unchanged();
+    }
+
+    const finalDecision = decision;
+    const metadata = { providerStatus, reason: params.reason, failureCode: finalDecision.failureCode };
+    try {
+      await db.$transaction(async (tx) => {
+        await tx.paymentAttempt.update({
+          where: { id: attempt.id, captureLeaseToken: leaseToken, status: PaymentAttemptStatus.AWAITING_APPROVAL },
+          data: {
+            status: finalDecision.attemptStatus,
+            providerStatus,
+            failureCode: finalDecision.failureCode,
+            reconciliationNeeded: false,
+            lastCheckedAt: now,
+            captureLeaseToken: null,
+            captureLeaseUntil: null,
+            events: {
+              create: {
+                transactionId: attempt.transaction.id,
+                eventType: "PAYPAL_APPROVAL_RECONCILED",
+                fromStatus: PaymentAttemptStatus.AWAITING_APPROVAL,
+                toStatus: finalDecision.attemptStatus,
+                source: "PAYPAL_API",
+                requestId: requestId || null,
+                metadata,
+              },
+            },
+          },
+        });
+        await tx.transaction.update({
+          where: { id: attempt.transaction.id, status: TransactionStatus.AWAITING_APPROVAL },
+          data: {
+            status: finalDecision.transactionStatus,
+            failureCode: finalDecision.failureCode,
+            events: {
+              create: {
+                eventType:
+                  finalDecision.transactionStatus === TransactionStatus.CANCELLED
+                    ? "TRANSACTION_CANCELLED"
+                    : "TRANSACTION_FAILED",
+                fromStatus: TransactionStatus.AWAITING_APPROVAL,
+                toStatus: finalDecision.transactionStatus,
+                source: "PAYPAL_API",
+                requestId: requestId || null,
+                metadata,
+              },
+            },
+          },
+        });
+      });
+    } catch (error) {
+      logger.warn("Approval reconciliation could not be persisted; state left unchanged", {
+        requestId,
+        context: { transactionId: attempt.transaction.id, paymentAttemptId: attempt.id },
+        error,
+      });
+      await releaseLease();
+      const current = await db.transaction.findUnique({
+        where: { id: attempt.transaction.id },
+        select: { status: true },
+      });
+      return unchanged(current?.status ?? attempt.transaction.status);
+    }
+
+    logger.info("PayPal approval reconciled", {
+      requestId,
+      context: { transactionId: attempt.transaction.id, paymentAttemptId: attempt.id, ...metadata },
+    });
+
+    return {
+      transactionId: attempt.transaction.id,
+      merchantId: attempt.transaction.merchantId,
+      status: finalDecision.transactionStatus,
+      outcome: finalDecision.outcome,
+    };
+  }
+
+  /**
+   * Bounded reconciliation of this session's abandoned approvals (buyer closed
+   * the PayPal window). Only attempts older than STALE_APPROVAL_AGE_MS are
+   * checked, at most once per STALE_APPROVAL_RECHECK_MS, and never more than
+   * STALE_APPROVAL_SWEEP_LIMIT per call. Never captures and never throws.
+   */
+  async reconcileStaleApprovals(sessionId: string, requestId?: string): Promise<number> {
+    const now = Date.now();
+    let changed = 0;
+    try {
+      const stale = await db.paymentAttempt.findMany({
+        where: {
+          provider: PaymentProvider.PAYPAL,
+          status: PaymentAttemptStatus.AWAITING_APPROVAL,
+          providerOrderId: { not: null },
+          createdAt: { lte: new Date(now - STALE_APPROVAL_AGE_MS) },
+          OR: [
+            { lastCheckedAt: null },
+            { lastCheckedAt: { lte: new Date(now - STALE_APPROVAL_RECHECK_MS) } },
+          ],
+          transaction: { demoSessionId: sessionId, status: TransactionStatus.AWAITING_APPROVAL },
+        },
+        select: { providerOrderId: true },
+        orderBy: { createdAt: "asc" },
+        take: STALE_APPROVAL_SWEEP_LIMIT,
+      });
+
+      for (const item of stale) {
+        if (!item.providerOrderId) continue;
+        try {
+          const result = await this.reconcileAwaitingApproval(
+            sessionId,
+            { providerOrderId: item.providerOrderId, reason: "STALE_APPROVAL_SWEEP" },
+            requestId
+          );
+          if (result.outcome !== "UNCHANGED") changed++;
+        } catch (error) {
+          logger.warn("Stale approval reconciliation failed for one attempt", { requestId, error });
+        }
+      }
+    } catch (error) {
+      logger.warn("Stale approval sweep failed", { requestId, error });
+    }
+    return changed;
   }
 }
 

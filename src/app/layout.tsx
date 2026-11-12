@@ -52,7 +52,7 @@ export const viewport: Viewport = {
 export default function RootLayout({ children }: LayoutProps<"/">) {
   return (
     <html lang="en" className={`${inter.variable} ${jetBrainsMono.variable} h-full antialiased`}>
-      <body className="min-h-full">
+      <body className="min-h-full" suppressHydrationWarning>
         <MotionProvider>
           <SessionProvider>
             <BankLinkingProvider>

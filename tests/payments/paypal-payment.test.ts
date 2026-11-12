@@ -5,12 +5,21 @@ import { createDemoSession } from "@/lib/auth/session-service";
 import { seedDemoMerchants } from "@/lib/merchants/merchant-service";
 import { transactionService } from "@/lib/payments/transaction-service";
 import { PayPalPaymentService } from "@/lib/payments/paypal-payment-service";
-import { PayPalClient, type PayPalOrderResponse, type PayPalCaptureResponse, type PayPalOrderDetails } from "@/lib/paypal/paypal-client";
+import {
+  PayPalClient,
+  PayPalOrderCreationError,
+  PayPalOrderNotFoundError,
+  type PayPalOrderResponse,
+  type PayPalCaptureResponse,
+  type PayPalOrderDetails,
+} from "@/lib/paypal/paypal-client";
+import { STALE_APPROVAL_AGE_MS } from "@/lib/payments/paypal-payment-service";
 import { BankConnectionStatus, TransactionStatus, Prisma } from "@prisma/client";
 import { ApiError } from "@/lib/errors/api-error";
 import { POST as transactionsPostHandler, GET as transactionsGetHandler } from "@/app/api/transactions/route";
 import { GET as transactionDetailGetHandler } from "@/app/api/transactions/[id]/route";
 import { GET as resolveGetHandler } from "@/app/api/payments/paypal/resolve/route";
+import { POST as cancelPostHandler } from "@/app/api/payments/paypal/cancel/route";
 
 class MockPayPalClient extends PayPalClient {
   public tokenCalls = 0;
@@ -32,6 +41,8 @@ class MockPayPalClient extends PayPalClient {
   public onGetOrder?: () => void;
   public onCapture?: () => void;
   public capturesList?: Array<{ id: string; status: string; amount: string; currency: string }>;
+  public createOrderError?: Error;
+  public getOrderError?: Error;
 
   override async getAccessToken(): Promise<string> {
     this.tokenCalls++;
@@ -44,6 +55,7 @@ class MockPayPalClient extends PayPalClient {
   ): Promise<PayPalOrderResponse> {
     this.createOrderCalls++;
     this.lastCreateRequestId = requestId;
+    if (this.createOrderError) throw this.createOrderError;
     const orderId = `MOCK_ORDER_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     return {
       id: orderId,
@@ -55,6 +67,7 @@ class MockPayPalClient extends PayPalClient {
   override async getOrder(orderId: string): Promise<PayPalOrderDetails> {
     this.getOrderCalls++;
     this.onGetOrder?.();
+    if (this.getOrderError) throw this.getOrderError;
     await this.getOrderGate;
     return {
       id: orderId,
@@ -1009,5 +1022,240 @@ describe("Phase 6: PayPal Sandbox Payment Lifecycle", () => {
     const transactionAfter = await db.transaction.findUnique({ where: { id: txn.id } });
     assert.strictEqual(result.status, "STATUS_UNKNOWN");
     assert.strictEqual(transactionAfter?.status, TransactionStatus.STATUS_UNKNOWN);
+  });
+  // ---------------------------------------------------------------------------
+  // Cancellation, abandonment and currency handling (payment-flow.md PF-02, PF-17)
+  // ---------------------------------------------------------------------------
+
+  async function createAwaitingOrder(key: string) {
+    const setup = await setupSessionWithBank();
+    const txn = await transactionService.createTransaction(setup.session.id, {
+      merchantId: "kyoto-ryokan-stay",
+      amount: "25000",
+      currency: "JPY",
+    });
+    const order = await paymentService.createPayPalOrder(setup.session.id, {
+      transactionId: txn.id,
+      idempotencyKey: `${key}_${txn.id}`,
+    });
+    return { ...setup, txn, order };
+  }
+
+  it("30. cancel return marks an unapproved order CANCELLED only after PayPal verification", async () => {
+    const { session, txn, order } = await createAwaitingOrder("cancel_verified");
+    mockClient.orderStatus = "CREATED";
+
+    const result = await paymentService.reconcileAwaitingApproval(session.id, {
+      providerOrderId: order.providerOrderId,
+      reason: "BUYER_RETURNED_TO_CANCEL_URL",
+    });
+
+    assert.strictEqual(result.outcome, "CANCELLED");
+    assert.strictEqual(result.status, TransactionStatus.CANCELLED);
+    assert.strictEqual(mockClient.getOrderCalls, 1);
+    const stored = await db.transaction.findUnique({ where: { id: txn.id }, include: { paymentAttempts: true } });
+    assert.strictEqual(stored?.status, TransactionStatus.CANCELLED);
+    assert.strictEqual(stored?.failureCode, "BUYER_CANCELLED");
+    assert.strictEqual(stored?.paymentAttempts[0].status, "CANCELLED");
+    assert.strictEqual(stored?.paymentAttempts[0].captureLeaseToken, null);
+    assert.strictEqual(stored?.completedAt, null);
+  });
+
+  it("31. a cancelled order can never be captured or re-ordered", async () => {
+    const { session, txn, order } = await createAwaitingOrder("cancel_then_capture");
+    mockClient.orderStatus = "CREATED";
+    await paymentService.reconcileAwaitingApproval(session.id, {
+      providerOrderId: order.providerOrderId,
+      reason: "BUYER_RETURNED_TO_CANCEL_URL",
+    });
+
+    mockClient.orderStatus = "APPROVED";
+    await assert.rejects(
+      () => paymentService.capturePayPalOrder(session.id, { transactionId: txn.id, idempotencyKey: `cap_${txn.id}` }),
+      (err: unknown) => err instanceof ApiError && err.code === "TRANSACTION_STATE_CONFLICT"
+    );
+    await assert.rejects(
+      () => paymentService.createPayPalOrder(session.id, { transactionId: txn.id, idempotencyKey: `recreate_${txn.id}` }),
+      (err: unknown) => err instanceof ApiError && err.code === "TRANSACTION_STATE_CONFLICT"
+    );
+    assert.strictEqual(mockClient.captureCalls, 0);
+    assert.strictEqual(mockClient.createOrderCalls, 1);
+  });
+
+  it("32. cancel return leaves an APPROVED order untouched so capture still completes", async () => {
+    const { session, txn, order } = await createAwaitingOrder("cancel_but_approved");
+    mockClient.orderStatus = "APPROVED";
+
+    const result = await paymentService.reconcileAwaitingApproval(session.id, {
+      providerOrderId: order.providerOrderId,
+      reason: "BUYER_RETURNED_TO_CANCEL_URL",
+    });
+    assert.strictEqual(result.outcome, "UNCHANGED");
+    assert.strictEqual(result.status, TransactionStatus.AWAITING_APPROVAL);
+
+    const capture = await paymentService.capturePayPalOrder(session.id, {
+      transactionId: txn.id,
+      idempotencyKey: `cap_${txn.id}`,
+    });
+    assert.strictEqual(capture.status, "COMPLETED");
+  });
+
+  it("33. repeated cancel returns are idempotent and record one cancellation event", async () => {
+    const { session, txn, order } = await createAwaitingOrder("cancel_repeat");
+    mockClient.orderStatus = "CREATED";
+    const params = { providerOrderId: order.providerOrderId, reason: "BUYER_RETURNED_TO_CANCEL_URL" as const };
+
+    const first = await paymentService.reconcileAwaitingApproval(session.id, params);
+    const second = await paymentService.reconcileAwaitingApproval(session.id, params);
+
+    assert.strictEqual(first.outcome, "CANCELLED");
+    assert.strictEqual(second.outcome, "UNCHANGED");
+    assert.strictEqual(second.status, TransactionStatus.CANCELLED);
+    assert.strictEqual(mockClient.getOrderCalls, 1);
+    const events = await db.transactionEvent.count({ where: { transactionId: txn.id, eventType: "TRANSACTION_CANCELLED" } });
+    assert.strictEqual(events, 1);
+  });
+
+  it("34. provider outage during cancel reconciliation leaves the transaction pending and releases the lease", async () => {
+    const { session, txn, order } = await createAwaitingOrder("cancel_outage");
+    mockClient.getOrderError = new Error("PAYPAL_TIMEOUT");
+
+    const result = await paymentService.reconcileAwaitingApproval(session.id, {
+      providerOrderId: order.providerOrderId,
+      reason: "BUYER_RETURNED_TO_CANCEL_URL",
+    });
+
+    assert.strictEqual(result.outcome, "UNCHANGED");
+    const stored = await db.transaction.findUnique({ where: { id: txn.id }, include: { paymentAttempts: true } });
+    assert.strictEqual(stored?.status, TransactionStatus.AWAITING_APPROVAL);
+    assert.strictEqual(stored?.paymentAttempts[0].captureLeaseToken, null);
+  });
+
+  it("35. stale sweep expires abandoned orders PayPal no longer has, but not recent or still-open ones", async () => {
+    const { session } = await setupSessionWithBank();
+    const makeOrder = async (ageMs: number) => {
+      const txn = await transactionService.createTransaction(session.id, {
+        merchantId: "kyoto-ryokan-stay",
+        amount: "25000",
+        currency: "JPY",
+      });
+      await paymentService.createPayPalOrder(session.id, { transactionId: txn.id, idempotencyKey: `sweep_${txn.id}` });
+      await db.paymentAttempt.updateMany({
+        where: { transactionId: txn.id },
+        data: { createdAt: new Date(Date.now() - ageMs) },
+      });
+      return txn;
+    };
+    const abandoned = await makeOrder(STALE_APPROVAL_AGE_MS + 60_000);
+    const recent = await makeOrder(5 * 60_000);
+
+    mockClient.getOrderError = new PayPalOrderNotFoundError();
+    const changed = await paymentService.reconcileStaleApprovals(session.id);
+
+    assert.strictEqual(changed, 1);
+    assert.strictEqual(mockClient.getOrderCalls, 1, "recent attempts are not queried by the sweep");
+    const abandonedRow = await db.transaction.findUnique({ where: { id: abandoned.id } });
+    const recentRow = await db.transaction.findUnique({ where: { id: recent.id } });
+    assert.strictEqual(abandonedRow?.status, TransactionStatus.CANCELLED);
+    assert.strictEqual(abandonedRow?.failureCode, "PAYPAL_ORDER_EXPIRED");
+    assert.strictEqual(recentRow?.status, TransactionStatus.AWAITING_APPROVAL);
+
+    // A stale order PayPal still reports as CREATED is left alone (buyer may still approve).
+    const stillOpen = await makeOrder(STALE_APPROVAL_AGE_MS + 60_000);
+    mockClient.getOrderError = undefined;
+    mockClient.orderStatus = "CREATED";
+    await paymentService.reconcileStaleApprovals(session.id);
+    const stillOpenRow = await db.transaction.findUnique({ where: { id: stillOpen.id } });
+    assert.strictEqual(stillOpenRow?.status, TransactionStatus.AWAITING_APPROVAL);
+
+    // ...and is not re-queried again within the recheck window.
+    const callsBefore = mockClient.getOrderCalls;
+    await paymentService.reconcileStaleApprovals(session.id);
+    assert.strictEqual(mockClient.getOrderCalls, callsBefore);
+  });
+
+  it("36. PayPal EXPIRED and VOIDED orders map to CANCELLED and FAILED", async () => {
+    const expired = await createAwaitingOrder("expired_state");
+    mockClient.orderStatus = "EXPIRED";
+    const expiredResult = await paymentService.reconcileAwaitingApproval(expired.session.id, {
+      providerOrderId: expired.order.providerOrderId,
+      reason: "STALE_APPROVAL_SWEEP",
+    });
+    assert.strictEqual(expiredResult.outcome, "EXPIRED");
+    assert.strictEqual(expiredResult.status, TransactionStatus.CANCELLED);
+
+    const voided = await createAwaitingOrder("voided_state");
+    mockClient.orderStatus = "VOIDED";
+    const voidedResult = await paymentService.reconcileAwaitingApproval(voided.session.id, {
+      providerOrderId: voided.order.providerOrderId,
+      reason: "STALE_APPROVAL_SWEEP",
+    });
+    assert.strictEqual(voidedResult.outcome, "FAILED");
+    assert.strictEqual(voidedResult.status, TransactionStatus.FAILED);
+  });
+
+  it("37. POST /api/payments/paypal/cancel rejects another session's order token", async () => {
+    const { order } = await createAwaitingOrder("cancel_cross_session");
+    const { rawToken: otherToken } = await setupSessionWithBank();
+
+    const response = await cancelPostHandler(
+      new Request("http://localhost:3000/api/payments/paypal/cancel", {
+        method: "POST",
+        headers: {
+          Cookie: `gp_session=${otherToken}`,
+          Origin: "http://localhost:3000",
+          Host: "localhost:3000",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ token: order.providerOrderId }),
+      })
+    );
+    assert.strictEqual(response.status, 404);
+    assert.strictEqual(mockClient.getOrderCalls, 0);
+  });
+
+  it("38. rejects a currency PayPal cannot accept before calling PayPal", async () => {
+    const { session } = await setupSessionWithBank();
+    const txn = await transactionService.createTransaction(session.id, {
+      merchantId: "kyoto-ryokan-stay",
+      amount: "25000",
+      currency: "JPY",
+    });
+    await db.transaction.update({ where: { id: txn.id }, data: { currency: "INR" } });
+
+    await assert.rejects(
+      () => paymentService.createPayPalOrder(session.id, { transactionId: txn.id, idempotencyKey: `inr_${txn.id}` }),
+      (err: unknown) =>
+        err instanceof ApiError &&
+        err.code === "UNSUPPORTED_CURRENCY" &&
+        err.statusCode === 422 &&
+        err.message.includes("INR") &&
+        err.message.includes("USD")
+    );
+    assert.strictEqual(mockClient.createOrderCalls, 0);
+  });
+
+  it("39. maps PayPal CURRENCY_NOT_SUPPORTED to a clear 422 and records the attempt as failed", async () => {
+    const { session } = await setupSessionWithBank();
+    const txn = await transactionService.createTransaction(session.id, {
+      merchantId: "kyoto-ryokan-stay",
+      amount: "25000",
+      currency: "JPY",
+    });
+    mockClient.createOrderError = new PayPalOrderCreationError(
+      "PAYPAL_ORDER_CREATION_FAILED_422",
+      "rejected",
+      "CURRENCY_NOT_SUPPORTED"
+    );
+
+    await assert.rejects(
+      () => paymentService.createPayPalOrder(session.id, { transactionId: txn.id, idempotencyKey: `cns_${txn.id}` }),
+      (err: unknown) => err instanceof ApiError && err.code === "UNSUPPORTED_CURRENCY" && err.statusCode === 422
+    );
+    const attempt = await db.paymentAttempt.findFirst({ where: { transactionId: txn.id } });
+    assert.strictEqual(attempt?.status, "FAILED");
+    const stored = await db.transaction.findUnique({ where: { id: txn.id } });
+    assert.strictEqual(stored?.amount.toString(), "25000");
+    assert.strictEqual(stored?.currency, "JPY");
   });
 });

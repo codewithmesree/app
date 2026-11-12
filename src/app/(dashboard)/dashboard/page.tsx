@@ -21,7 +21,7 @@ export default async function DashboardPage({ searchParams }: PageProps<"/dashbo
     <div className="flex flex-col gap-6 lg:gap-8">
       <DashboardWorkspace rateStatus={rateStatus} notice={<SampleDataNotice current={preview} />} />
       <Reveal order={3}>
-        <RecentTransactionsCard state={overrideState} />
+        <RecentTransactionsCard state={overrideState} isPreview={Boolean(rawPreview)} />
       </Reveal>
       <Reveal order={4}>
         <QuickLinks />

@@ -30,6 +30,7 @@ export type ApiErrorCode =
   | "MESSAGE_INVALID"
   | "RATE_LIMITED"
   | "PAYPAL_PROVIDER_ERROR"
+  | "PAYPAL_CONFIGURATION_ERROR"
   | "AI_PROVIDER_ERROR"
   | "PAYPAL_UNAVAILABLE"
   | "QUOTE_UNAVAILABLE"
@@ -109,4 +110,3 @@ export class ApiError extends Error {
     return new ApiError({ statusCode: 500, code: "INTERNAL_ERROR", message, cause, isOperational: false });
   }
 }
-

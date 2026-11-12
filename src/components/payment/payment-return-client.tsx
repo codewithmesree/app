@@ -2,12 +2,17 @@
 
 import { CheckCircle2, AlertTriangle, ArrowRight } from "lucide-react";
 import Link from "next/link";
-import { useSearchParams } from "next/navigation";
-import { useEffect, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+import { useEffect, useRef, useState } from "react";
 import { Reveal } from "@/components/motion/reveal";
 import { Badge } from "@/components/ui/badge";
 import { Card } from "@/components/ui/card";
 import { formatDecimal } from "@/lib/format-money";
+import {
+  POST_PAYMENT_REDIRECT_DELAY_MS,
+  POST_PAYMENT_REDIRECT_PATH,
+  shouldRedirectAfterPayment,
+} from "@/lib/payments/post-payment-redirect";
 
 interface CapturedState {
   transactionId: string;
@@ -18,7 +23,60 @@ interface CapturedState {
   providerCaptureId?: string;
 }
 
+// One server-side resolve + capture per PayPal token, shared across React
+// Strict Mode effect re-runs. Without this, development mode sends two capture
+// requests: the second finds the first one's lease and reports "under review"
+// even when the first capture succeeded. Failed requests are evicted so the
+// user can retry; the server's idempotency key makes retries safe.
+const captureRequests = new Map<string, Promise<CapturedState>>();
+
+async function errorMessage(response: Response, fallback: string): Promise<string> {
+  const data: unknown = await response.json().catch(() => null);
+  if (typeof data === "object" && data !== null) {
+    const error = (data as Record<string, unknown>).error;
+    if (typeof error === "object" && error !== null) {
+      const message = (error as Record<string, unknown>).message;
+      if (typeof message === "string" && message) return message;
+    }
+  }
+  return fallback;
+}
+
+function resolveAndCapture(token: string): Promise<CapturedState> {
+  const existing = captureRequests.get(token);
+  if (existing) return existing;
+
+  const request = (async () => {
+    // 1. Authoritatively resolve the session-owned transaction matching this PayPal order token
+    const resolveRes = await fetch(`/api/payments/paypal/resolve?token=${encodeURIComponent(token)}`, {
+      cache: "no-store",
+    });
+    if (!resolveRes.ok) {
+      throw new Error(await errorMessage(resolveRes, "Could not resolve matching transaction for this order."));
+    }
+    const resolved = await resolveRes.json();
+    const transactionId = resolved.transactionId;
+
+    // 2. Perform authoritative server-side capture or recovery
+    const idempotencyKey = `capture_${transactionId}_${token}`;
+    const captureRes = await fetch("/api/payments/paypal/capture", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ transactionId, idempotencyKey }),
+    });
+    if (!captureRes.ok) {
+      throw new Error(await errorMessage(captureRes, "Failed to capture payment."));
+    }
+    return (await captureRes.json()) as CapturedState;
+  })();
+
+  captureRequests.set(token, request);
+  request.catch(() => captureRequests.delete(token));
+  return request;
+}
+
 export function PaymentReturnClient() {
+  const router = useRouter();
   const searchParams = useSearchParams();
   const token = searchParams.get("token"); // PayPal order ID
   const [loading, setLoading] = useState(true);
@@ -39,32 +97,7 @@ export function PaymentReturnClient() {
       }
 
       try {
-        // 1. Authoritatively resolve the session-owned transaction matching this PayPal order token
-        const resolveRes = await fetch(`/api/payments/paypal/resolve?token=${encodeURIComponent(token)}`);
-        if (!resolveRes.ok) {
-          const errData = await resolveRes.json().catch(() => null);
-          throw new Error(errData?.error?.message || "Could not resolve matching transaction for this order.");
-        }
-        const resolved = await resolveRes.json();
-        const transactionId = resolved.transactionId;
-
-        // 2. Perform authoritative server-side capture or recovery
-        const idempotencyKey = `capture_${transactionId}_${token}`;
-        const captureRes = await fetch("/api/payments/paypal/capture", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            transactionId,
-            idempotencyKey,
-          }),
-        });
-
-        if (!captureRes.ok) {
-          const errData = await captureRes.json();
-          throw new Error(errData?.error?.message || "Failed to capture payment.");
-        }
-
-        const captureData = await captureRes.json();
+        const captureData = await resolveAndCapture(token);
         if (isMounted) {
           setCaptured(captureData);
           setLoading(false);
@@ -84,7 +117,31 @@ export function PaymentReturnClient() {
     };
   }, [token, recheckCount]);
 
+  // Redirect to the dashboard only after the backend confirms COMPLETED.
+  // The timer is cleared on unmount or state change, and the ref guarantees a
+  // single navigation even if the effect re-runs (e.g. React Strict Mode).
+  const hasRedirectedRef = useRef(false);
+  const isConfirmedComplete = shouldRedirectAfterPayment(captured);
+
+  useEffect(() => {
+    if (!isConfirmedComplete || hasRedirectedRef.current) return;
+
+    const timer = setTimeout(() => {
+      if (hasRedirectedRef.current) return;
+      hasRedirectedRef.current = true;
+      router.replace(POST_PAYMENT_REDIRECT_PATH);
+    }, POST_PAYMENT_REDIRECT_DELAY_MS);
+
+    return () => clearTimeout(timer);
+  }, [isConfirmedComplete, router]);
+
+  function goToDashboardNow() {
+    hasRedirectedRef.current = true;
+  }
+
   function recheckStatus() {
+    // Re-ask the server; the same idempotency key returns the stored result or reconciles.
+    if (token) captureRequests.delete(token);
     setError(null);
     setCaptured(null);
     setLoading(true);
@@ -207,8 +264,13 @@ export function PaymentReturnClient() {
 
       <Reveal order={2}>
         <div className="flex flex-col gap-3">
+          <p role="status" aria-live="polite" className="text-xs text-ink-muted">
+            Taking you to your dashboard in a few seconds…
+          </p>
           <Link
-            href="/dashboard"
+            href={POST_PAYMENT_REDIRECT_PATH}
+            replace
+            onClick={goToDashboardNow}
             className="inline-flex min-h-12 items-center justify-center rounded-control bg-primary px-6 text-sm font-medium text-white hover:bg-primary-hover"
           >
             Return to Dashboard

@@ -28,23 +28,24 @@ interface ApiTransactionItem {
 }
 
 export function RecentTransactionsCard({
-  state: initialOverrideState,
+  state: controlledState,
+  isPreview = false,
   onRetry,
 }: {
   state?: TransactionsState;
+  isPreview?: boolean;
   onRetry?: () => void;
 }) {
   const [liveState, setLiveState] = useState<TransactionsState>(
-    initialOverrideState || { status: "loading" }
+    controlledState || { status: "loading" }
   );
   const [retryCount, setRetryCount] = useState(0);
   const [selectedTransactionId, setSelectedTransactionId] = useState<string | null>(null);
   const closeReceipt = useCallback(() => setSelectedTransactionId(null), []);
 
   useEffect(() => {
-    // If an explicit override state was provided (e.g. from a preview query param),
-    // it was already used to initialise useState — no synchronous setState needed here.
-    if (initialOverrideState) return;
+    // Controlled pages render the latest prop directly and do not fetch here.
+    if (controlledState) return;
 
     let isMounted = true;
 
@@ -83,7 +84,7 @@ export function RecentTransactionsCard({
     return () => {
       isMounted = false;
     };
-  }, [initialOverrideState, retryCount]);
+  }, [controlledState, retryCount]);
 
   const retry = () => {
     if (onRetry) {
@@ -94,9 +95,8 @@ export function RecentTransactionsCard({
     }
   };
 
-  const state = liveState;
+  const state = controlledState ?? liveState;
   const hasItems = state.status === "ready" && state.items.length > 0;
-  const isPreview = Boolean(initialOverrideState);
 
   return (
     <Card aria-labelledby="recent-heading" aria-busy={state.status === "loading"} className="flex h-full flex-col gap-4">

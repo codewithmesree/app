@@ -58,3 +58,15 @@ export type CreateTransactionInput = z.infer<typeof createTransactionSchema>;
 export type CreatePayPalPaymentInput = z.infer<typeof createPayPalPaymentSchema>;
 export type CapturePayPalPaymentInput = z.infer<typeof capturePayPalPaymentSchema>;
 
+
+/** PayPal returns the order ID as `token` on the cancel URL. */
+export const cancelPayPalPaymentSchema = z.object({
+  token: z
+    .string()
+    .trim()
+    .min(1, "PayPal order token is required.")
+    .max(64)
+    .regex(/^[A-Za-z0-9_-]+$/, "PayPal order token is malformed."),
+});
+
+export type CancelPayPalPaymentInput = z.infer<typeof cancelPayPalPaymentSchema>;

@@ -58,10 +58,36 @@ export interface PayPalOrderDetails {
 export class PayPalOrderCreationError extends Error {
   constructor(
     message: string,
-    readonly outcome: "rejected" | "unknown"
+    readonly outcome: "rejected" | "unknown",
+    /** PayPal's documented issue code (e.g. CURRENCY_NOT_SUPPORTED), when provided. */
+    readonly issue?: string
   ) {
     super(message);
     this.name = "PayPalOrderCreationError";
+  }
+}
+
+/** PayPal answered 404 for an order: it never existed for this app or has expired and been purged. */
+export class PayPalOrderNotFoundError extends Error {
+  constructor() {
+    super("PAYPAL_GET_ORDER_FAILED_404");
+    this.name = "PayPalOrderNotFoundError";
+  }
+}
+
+/** Extracts PayPal's first `details[].issue` code from an error body without trusting its shape. */
+async function readPayPalIssue(response: Response): Promise<string | undefined> {
+  try {
+    const body: unknown = await response.json();
+    if (typeof body !== "object" || body === null) return undefined;
+    const details = (body as Record<string, unknown>).details;
+    if (!Array.isArray(details)) return undefined;
+    const first: unknown = details[0];
+    if (typeof first !== "object" || first === null) return undefined;
+    const issue = (first as Record<string, unknown>).issue;
+    return typeof issue === "string" && /^[A-Z0-9_]{1,80}$/.test(issue) ? issue : undefined;
+  } catch {
+    return undefined;
   }
 }
 
@@ -218,12 +244,14 @@ export class PayPalClient {
     }
 
     if (!response.ok) {
+      const issue = await readPayPalIssue(response);
       logger.error("PayPal create order failed", {
-        context: { status: response.status },
+        context: { status: response.status, issue, currency: params.currency },
       });
       throw new PayPalOrderCreationError(
         `PAYPAL_ORDER_CREATION_FAILED_${response.status}`,
-        response.status >= 500 ? "unknown" : "rejected"
+        response.status >= 500 ? "unknown" : "rejected",
+        issue
       );
     }
 
@@ -290,6 +318,9 @@ export class PayPalClient {
       clearTimeout(timer);
     }
 
+    if (response.status === 404) {
+      throw new PayPalOrderNotFoundError();
+    }
     if (!response.ok) {
       throw new Error(`PAYPAL_GET_ORDER_FAILED_${response.status}`);
     }
